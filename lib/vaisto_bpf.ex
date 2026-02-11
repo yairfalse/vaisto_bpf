@@ -11,12 +11,16 @@ defmodule VaistoBpf do
 
   ## Usage
 
+      # From source (recommended):
       source = "(defn add [x :u64 y :u64] :u64 (+ x y))"
-      {:ok, ast} = Vaisto.Parser.parse(source)
-      {:ok, _type, typed_ast} = Vaisto.TypeChecker.check(ast)
+      {:ok, instructions} = VaistoBpf.compile_source(source)
+
+      # From pre-typed AST (Phase 1 API):
       {:ok, instructions} = VaistoBpf.compile(typed_ast)
   """
 
+  alias VaistoBpf.Preprocessor
+  alias VaistoBpf.BpfTypeChecker
   alias VaistoBpf.Validator
   alias VaistoBpf.Emitter
   alias VaistoBpf.Assembler
@@ -33,6 +37,32 @@ defmodule VaistoBpf do
          {:ok, ir} <- Emitter.emit(ast),
          {:ok, instructions} <- Assembler.assemble(ir) do
       {:ok, instructions}
+    end
+  end
+
+  @doc """
+  Compile a Vaisto source string with BPF types directly to eBPF bytecode.
+
+  Handles the full pipeline: preprocess (`:u64` → `:U64`) → parse → normalize
+  (`:U64` → `:u64`) → BPF type check → validate → emit → assemble.
+
+  ## Example
+
+      source = \"""
+      (defn add [x :u64 y :u64] :u64 (+ x y))
+      \"""
+      {:ok, instructions} = VaistoBpf.compile_source(source)
+
+  Returns `{:ok, bytecode}` or `{:error, %Vaisto.Error{}}`.
+  """
+  @spec compile_source(String.t()) :: {:ok, [binary()]} | {:error, Vaisto.Error.t()}
+  def compile_source(source) do
+    preprocessed = Preprocessor.preprocess_source(source)
+    parsed = Vaisto.Parser.parse(preprocessed)
+    normalized = Preprocessor.normalize_ast(parsed)
+
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized) do
+      compile(typed_ast)
     end
   end
 
