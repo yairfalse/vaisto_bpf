@@ -75,6 +75,15 @@ defmodule VaistoBpf.BpfTypeChecker do
     collect_signatures(rest, Map.put(env, name, fn_type))
   end
 
+  # 6-element extern: collect into env so functions can reference helpers
+  defp collect_signatures([{:extern, mod, name, arg_types, ret_type, _loc} | rest], env) do
+    fn_type = {:fn, arg_types, ret_type}
+    env = env
+          |> Map.put(name, fn_type)
+          |> Map.put({:qualified, mod, name}, fn_type)
+    collect_signatures(rest, env)
+  end
+
   defp collect_signatures([_ | rest], env) do
     collect_signatures(rest, env)
   end
@@ -106,7 +115,20 @@ defmodule VaistoBpf.BpfTypeChecker do
     {:ok, :unit, {:import, mod, als}, env}
   end
 
-  # extern — validate types, add to env
+  # extern with separate arg_types and ret_type (6-element from preprocessor)
+  defp check_form({:extern, mod, name, arg_types, ret_type, _loc}, env) do
+    with :ok <- validate_bpf_type(ret_type),
+         :ok <- validate_type_list(arg_types) do
+      fn_type = {:fn, arg_types, ret_type}
+      # Store both as bare name and as qualified key for lookup in calls
+      env = env
+            |> Map.put(name, fn_type)
+            |> Map.put({:qualified, mod, name}, fn_type)
+      {:ok, fn_type, {:extern, mod, name, fn_type}, env}
+    end
+  end
+
+  # extern (5-element fallback)
   defp check_form({:extern, mod, name, type_expr, _loc}, env) do
     with :ok <- validate_bpf_type(type_expr) do
       fn_type = normalize_extern_type(type_expr)
@@ -241,6 +263,30 @@ defmodule VaistoBpf.BpfTypeChecker do
 
       err ->
         err
+    end
+  end
+
+  # Qualified call (e.g., bpf/ktime_get_ns)
+  defp check_expr({:call, {:qualified, mod, name} = qname, args, _loc}, env, _expected) do
+    case Map.fetch(env, {:qualified, mod, name}) do
+      {:ok, {:fn, param_types, ret_type}} ->
+        if length(args) != length(param_types) do
+          {:error, Error.new("helper `#{mod}/#{name}` expects #{length(param_types)} arguments, got #{length(args)}")}
+        else
+          case check_call_args(qname, args, param_types, ret_type, env) do
+            {:ok, ret_type, {:call, _qname, typed_args, ret_type}} ->
+              {:ok, ret_type, {:call, {:qualified, mod, name}, typed_args, ret_type}}
+            err -> err
+          end
+        end
+
+      {:ok, _} ->
+        {:error, Error.new("`#{mod}/#{name}` is not a function")}
+
+      :error ->
+        {:error, Error.new("unknown helper `#{mod}/#{name}`",
+          hint: "declare it with (extern #{mod}:#{name} [arg-types] :ret-type)"
+        )}
     end
   end
 
@@ -601,6 +647,15 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   defp validate_param_types(params) do
     Enum.reduce_while(params, :ok, fn {_name, type}, :ok ->
+      case validate_bpf_type(type) do
+        :ok -> {:cont, :ok}
+        err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp validate_type_list(types) when is_list(types) do
+    Enum.reduce_while(types, :ok, fn type, :ok ->
       case validate_bpf_type(type) do
         :ok -> {:cont, :ok}
         err -> {:halt, err}

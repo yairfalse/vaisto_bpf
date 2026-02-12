@@ -271,6 +271,43 @@ defmodule VaistoBpf.Emitter do
     {dst, ctx}
   end
 
+  # BPF helper call: (bpf/ktime_get_ns), (bpf/map_lookup_elem fd key)
+  defp emit_node({:call, {:qualified, :bpf, helper_name}, args, _ret_type}, ctx) do
+    helper_id = VaistoBpf.Helpers.helper_id!(helper_name)
+
+    # 1. Evaluate all args into temporary registers first
+    {arg_regs, ctx} =
+      Enum.map_reduce(args, ctx, fn arg, ctx ->
+        emit_node(arg, ctx)
+      end)
+
+    # 2. Spill any live variables in r1-r5 to callee-saved regs (r6-r9)
+    {ctx, restore_map} = spill_caller_saved(ctx)
+
+    # 3. Remap arg_regs: if an arg was in a spilled register, read from
+    #    the callee-saved copy instead (avoids register-move cycle bugs)
+    arg_regs = Enum.map(arg_regs, fn reg -> Map.get(restore_map, reg, reg) end)
+
+    # 4. Move evaluated args to r1-r5 (BPF calling convention)
+    ctx =
+      arg_regs
+      |> Enum.with_index(Types.r1())
+      |> Enum.reduce(ctx, fn {src_reg, dst_reg}, ctx ->
+        if src_reg == dst_reg, do: ctx, else: push(ctx, {:mov_reg, dst_reg, src_reg})
+      end)
+
+    # 5. Emit call
+    ctx = push(ctx, {:call, helper_id})
+
+    # 6. Copy result from r0 to an allocated register
+    {result_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:mov_reg, result_reg, Types.r0()})
+
+    # Variables were already rebound to callee-saved locations during spill
+
+    {result_reg, ctx}
+  end
+
   # Generic call (catch-all for builtins we don't special-case)
   defp emit_node({:call, _op, args, _ret_type}, ctx) do
     # Emit all args, return the last one (placeholder for unknown ops)
@@ -393,6 +430,55 @@ defmodule VaistoBpf.Emitter do
   defp emit_pattern_check(_pattern, _expr_reg, _fail_label, ctx) do
     # Catch-all: skip pattern check (will match anything)
     ctx
+  end
+
+  # ============================================================================
+  # Helper Call Register Spilling
+  # ============================================================================
+
+  # BPF calling convention: r1-r5 are caller-saved (clobbered by helper calls).
+  # Before a helper call, we must save any live variables in r1-r5 to
+  # callee-saved registers r6-r9. After the call, variable lookups use
+  # the new locations.
+  #
+  # Returns {updated_ctx, restore_map} where restore_map is %{old_reg => new_reg}
+  defp spill_caller_saved(ctx) do
+    # Find variables currently mapped to r1-r5
+    vars_in_caller_saved =
+      ctx.vars
+      |> Enum.filter(fn {_name, reg} -> reg >= Types.r1() and reg <= Types.r5() end)
+      |> Enum.sort_by(fn {_name, reg} -> reg end)
+
+    if vars_in_caller_saved == [] do
+      {ctx, %{}}
+    else
+      # Allocate callee-saved regs (r6-r9) for spilling
+      available = callee_saved_available(ctx)
+
+      if length(vars_in_caller_saved) > length(available) do
+        raise "too many live values across helper call (max #{length(available)} callee-saved registers available)"
+      end
+
+      {ctx, restore_map} =
+        Enum.zip(vars_in_caller_saved, available)
+        |> Enum.reduce({ctx, %{}}, fn {{var_name, old_reg}, save_reg}, {ctx, rmap} ->
+          ctx = push(ctx, {:mov_reg, save_reg, old_reg})
+          ctx = bind_var(ctx, var_name, save_reg)
+          {ctx, Map.put(rmap, old_reg, save_reg)}
+        end)
+
+      # Ensure next_reg stays past any callee-saved regs we used
+      max_used = available |> Enum.take(length(vars_in_caller_saved)) |> Enum.max()
+      ctx = %{ctx | next_reg: max(ctx.next_reg, max_used + 1)}
+
+      {ctx, restore_map}
+    end
+  end
+
+  # Returns list of callee-saved registers (r6-r9) not currently in use
+  defp callee_saved_available(ctx) do
+    used = ctx.vars |> Map.values() |> MapSet.new()
+    Enum.reject(Types.r6()..Types.r9(), &MapSet.member?(used, &1))
   end
 
   # ============================================================================

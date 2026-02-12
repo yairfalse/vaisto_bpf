@@ -122,7 +122,14 @@ defmodule VaistoBpf.Preprocessor do
   def normalize_ast({:ns, name, loc}), do: {:ns, name, loc}
   def normalize_ast({:import, mod, als, loc}), do: {:import, mod, als, loc}
 
-  # extern: normalize the type
+  # extern with separate arg_types and ret_type (6-element from parser)
+  # Parser produces: {:extern, mod, func, [{:atom, :U64}, ...], {:atom, :U64}, loc}
+  def normalize_ast({:extern, mod, name, arg_types, ret_type, loc}) do
+    norm_args = Enum.map(arg_types, &unwrap_and_normalize/1)
+    {:extern, mod, name, norm_args, unwrap_and_normalize(ret_type), loc}
+  end
+
+  # extern (5-element fallback for pre-normalized forms)
   def normalize_ast({:extern, mod, name, type, loc}) do
     {:extern, mod, name, normalize_type(type), loc}
   end
@@ -170,6 +177,11 @@ defmodule VaistoBpf.Preprocessor do
   defp normalize_type({:list, elem}), do: {:list, normalize_type(elem)}
   defp normalize_type(atom) when is_atom(atom), do: normalize_type_atom(atom)
   defp normalize_type(other), do: other
+
+  # Unwrap {:atom, :U64} → :u64, or bare atom → normalized
+  defp unwrap_and_normalize({:atom, val}), do: normalize_type_atom(val)
+  defp unwrap_and_normalize(atom) when is_atom(atom), do: normalize_type_atom(atom)
+  defp unwrap_and_normalize(other), do: other
 
   # The core atom normalization: :U64 → :u64, :I32 → :i32, etc.
   defp normalize_type_atom(atom) when is_atom(atom) do
