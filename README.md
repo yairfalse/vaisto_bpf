@@ -40,6 +40,11 @@ source = """
 
 # bytecode is a list of 8-byte BPF instruction binaries
 length(bytecode)  #=> 4
+
+# Or compile directly to an ELF object file (.o)
+{:ok, elf} = VaistoBpf.compile_source_to_elf(source)
+File.write!("prog.o", elf)
+# Load with: bpftool prog load prog.o /sys/fs/bpf/my_prog
 ```
 
 ## Pipeline
@@ -53,19 +58,21 @@ length(bytecode)  #=> 4
   |> Validator.validate/1                # Reject unsupported constructs
   |> Emitter.emit/1                      # Typed AST → BPF IR
   |> Assembler.assemble/1                # IR → 8-byte instructions
+  |> ElfWriter.to_elf/2                  # Instructions → ELF object file
 ```
 
 ## Modules
 
 | Module | Purpose |
 |--------|---------|
-| `VaistoBpf` | Public API: `compile_source/1`, `compile/1`, `validate/1` |
+| `VaistoBpf` | Public API: `compile_source/1`, `compile_source_to_elf/2`, `compile/1`, `compile_to_elf/2`, `validate/1` |
 | `VaistoBpf.Preprocessor` | Bridges vaisto parser and BPF types via the capitalize trick |
 | `VaistoBpf.BpfTypeChecker` | Verification-based type checker (not HM inference) |
 | `VaistoBpf.Validator` | Rejects floats, strings, closures, recursion, processes |
 | `VaistoBpf.Emitter` | Typed AST → linear BPF IR with register allocation |
 | `VaistoBpf.Assembler` | Two-pass assembly: label resolution + binary encoding |
 | `VaistoBpf.Helpers` | BPF helper registry: kernel function IDs and type signatures |
+| `VaistoBpf.ElfWriter` | Wraps BPF bytecode in ELF relocatable object files (.o) |
 | `VaistoBpf.Types` | Opcodes, registers, instruction encoding/decoding |
 | `VaistoBpf.Layout` | C struct layout calculator (alignment, padding) |
 | `VaistoBpf.DecoderGenerator` | Auto-generates BEAM-side binary decoders for BPF record types |
@@ -144,4 +151,4 @@ mix test test/helper_call_test.exs
 
 ## Status
 
-Phase 3 complete. The compiler handles arithmetic, control flow, function definitions, record types, and kernel helper calls. Next up: ELF writer, BPF map definitions, and source maps.
+Phase 4 complete. The compiler handles arithmetic, control flow, function definitions, record types, kernel helper calls, and ELF output. Next up: BPF map definitions and source maps.

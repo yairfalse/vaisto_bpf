@@ -7,13 +7,17 @@ defmodule VaistoBpf do
 
   ## Pipeline
 
-      typed_ast → validate → emit IR → assemble → binary instructions
+      typed_ast → validate → emit IR → assemble → binary instructions → ELF (.o)
 
   ## Usage
 
-      # From source (recommended):
+      # From source to bytecode:
       source = "(defn add [x :u64 y :u64] :u64 (+ x y))"
       {:ok, instructions} = VaistoBpf.compile_source(source)
+
+      # From source to ELF object file:
+      {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
+      File.write!("prog.o", elf)
 
       # From pre-typed AST (Phase 1 API):
       {:ok, instructions} = VaistoBpf.compile(typed_ast)
@@ -24,6 +28,7 @@ defmodule VaistoBpf do
   alias VaistoBpf.Validator
   alias VaistoBpf.Emitter
   alias VaistoBpf.Assembler
+  alias VaistoBpf.ElfWriter
 
   @doc """
   Compile typed Vaisto AST to eBPF bytecode.
@@ -63,6 +68,33 @@ defmodule VaistoBpf do
 
     with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized) do
       compile(typed_ast)
+    end
+  end
+
+  @doc """
+  Compile a Vaisto source string to an ELF relocatable object binary.
+
+  Runs the full pipeline and wraps the output in ELF format suitable
+  for `bpftool prog load` or libbpf.
+
+  Options: `:section`, `:license`, `:function_name` (see `VaistoBpf.ElfWriter`).
+  """
+  @spec compile_source_to_elf(String.t(), keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
+  def compile_source_to_elf(source, opts \\ []) do
+    with {:ok, instructions} <- compile_source(source) do
+      ElfWriter.to_elf(instructions, opts)
+    end
+  end
+
+  @doc """
+  Compile typed Vaisto AST to an ELF relocatable object binary.
+
+  Options: `:section`, `:license`, `:function_name` (see `VaistoBpf.ElfWriter`).
+  """
+  @spec compile_to_elf(term(), keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
+  def compile_to_elf(typed_ast, opts \\ []) do
+    with {:ok, instructions} <- compile(typed_ast) do
+      ElfWriter.to_elf(instructions, opts)
     end
   end
 
