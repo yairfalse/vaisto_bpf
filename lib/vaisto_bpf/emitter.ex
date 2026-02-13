@@ -317,7 +317,11 @@ defmodule VaistoBpf.Emitter do
     {result_reg, ctx} = alloc_reg(ctx)
     ctx = push(ctx, {:mov_reg, result_reg, Types.r0()})
 
-    # Variables were already rebound to callee-saved locations during spill
+    # 7. Reclaim clobbered caller-saved registers.
+    #    After the call, r1-r5 are dead. Variables have been rebound to
+    #    callee-saved regs (r6-r9). Reset next_reg to just past the
+    #    highest register still in use, so future allocations can reuse r1-r5.
+    ctx = reclaim_registers(ctx, result_reg)
 
     {result_reg, ctx}
   end
@@ -493,6 +497,14 @@ defmodule VaistoBpf.Emitter do
   defp callee_saved_available(ctx) do
     used = ctx.vars |> Map.values() |> MapSet.new()
     Enum.reject(Types.r6()..Types.r9(), &MapSet.member?(used, &1))
+  end
+
+  # After a helper call, r1-r5 are dead (clobbered by calling convention).
+  # All variables were spilled to r6-r9 before the call, and result_reg
+  # is always >= r6 (allocated post-spill). Reset next_reg to r1 so
+  # subsequent code can reuse the caller-saved range.
+  defp reclaim_registers(ctx, _result_reg) do
+    %{ctx | next_reg: Types.r1()}
   end
 
   # ============================================================================

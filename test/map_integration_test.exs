@@ -308,6 +308,22 @@ defmodule VaistoBpf.MapIntegrationTest do
       assert String.contains?(strtab_data, "data")
     end
 
+    test "two map refs in one function (register reclaim)" do
+      source = """
+      (defmap counters :hash :u32 :u64 1024)
+      (defmap data :array :u32 :u64 256)
+      (extern bpf:map_lookup_elem [:u64 :u64] :u64)
+      (defn sum_lookups [key :u64] :u64
+        (+ (bpf/map_lookup_elem counters key)
+           (bpf/map_lookup_elem data key)))
+      """
+      {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
+
+      rel_idx = find_section_by_name(elf, ".rel.text")
+      rel_data = extract_section_data(elf, rel_idx)
+      assert byte_size(rel_data) >= 32, "should have at least 2 relocation entries"
+    end
+
     test "each map used in a separate function" do
       source = """
       (defmap counters :hash :u32 :u64 1024)
