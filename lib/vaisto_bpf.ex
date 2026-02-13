@@ -19,6 +19,14 @@ defmodule VaistoBpf do
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
       File.write!("prog.o", elf)
 
+      # With BPF maps:
+      source = \"""
+      (defmap counters :hash :u32 :u64 1024)
+      (extern bpf:map_lookup_elem [:u64 :u64] :u64)
+      (defn lookup [key :u64] :u64 (bpf/map_lookup_elem counters key))
+      \"""
+      {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
+
       # From pre-typed AST (Phase 1 API):
       {:ok, instructions} = VaistoBpf.compile(typed_ast)
   """
@@ -40,7 +48,7 @@ defmodule VaistoBpf do
   def compile(typed_ast) do
     with {:ok, ast} <- Validator.validate(typed_ast),
          {:ok, ir} <- Emitter.emit(ast),
-         {:ok, instructions} <- Assembler.assemble(ir) do
+         {:ok, instructions, _relocations} <- Assembler.assemble(ir) do
       {:ok, instructions}
     end
   end
@@ -48,26 +56,25 @@ defmodule VaistoBpf do
   @doc """
   Compile a Vaisto source string with BPF types directly to eBPF bytecode.
 
-  Handles the full pipeline: preprocess (`:u64` → `:U64`) → parse → normalize
-  (`:U64` → `:u64`) → BPF type check → validate → emit → assemble.
+  Handles the full pipeline: extract defmaps → preprocess → parse → normalize
+  → BPF type check → validate → emit → assemble.
 
-  ## Example
-
-      source = \"""
-      (defn add [x :u64 y :u64] :u64 (+ x y))
-      \"""
-      {:ok, instructions} = VaistoBpf.compile_source(source)
+  Supports `(defmap name :type :key :val max_entries)` declarations.
 
   Returns `{:ok, bytecode}` or `{:error, %Vaisto.Error{}}`.
   """
   @spec compile_source(String.t()) :: {:ok, [binary()]} | {:error, Vaisto.Error.t()}
   def compile_source(source) do
-    preprocessed = Preprocessor.preprocess_source(source)
+    {cleaned, maps} = Preprocessor.extract_defmaps(source)
+    preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
-    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized) do
-      compile(typed_ast)
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps),
+         {:ok, ast} <- Validator.validate(typed_ast),
+         {:ok, ir} <- Emitter.emit(ast, maps),
+         {:ok, instructions, _relocations} <- Assembler.assemble(ir) do
+      {:ok, instructions}
     end
   end
 
@@ -75,14 +82,24 @@ defmodule VaistoBpf do
   Compile a Vaisto source string to an ELF relocatable object binary.
 
   Runs the full pipeline and wraps the output in ELF format suitable
-  for `bpftool prog load` or libbpf.
+  for `bpftool prog load` or libbpf. When `defmap` declarations are present,
+  the ELF includes `.maps`, `.BTF`, and `.rel.text` sections.
 
   Options: `:section`, `:license`, `:function_name` (see `VaistoBpf.ElfWriter`).
   """
   @spec compile_source_to_elf(String.t(), keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
   def compile_source_to_elf(source, opts \\ []) do
-    with {:ok, instructions} <- compile_source(source) do
-      ElfWriter.to_elf(instructions, opts)
+    {cleaned, maps} = Preprocessor.extract_defmaps(source)
+    preprocessed = Preprocessor.preprocess_source(cleaned)
+    parsed = Vaisto.Parser.parse(preprocessed)
+    normalized = Preprocessor.normalize_ast(parsed)
+
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps),
+         {:ok, ast} <- Validator.validate(typed_ast),
+         {:ok, ir} <- Emitter.emit(ast, maps),
+         {:ok, instructions, relocations} <- Assembler.assemble(ir) do
+      elf_opts = opts ++ [maps: maps, relocations: relocations]
+      ElfWriter.to_elf(instructions, elf_opts)
     end
   end
 

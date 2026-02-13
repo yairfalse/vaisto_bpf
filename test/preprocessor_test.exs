@@ -91,6 +91,78 @@ defmodule VaistoBpf.PreprocessorTest do
     end
   end
 
+  describe "extract_defmaps/1" do
+    test "returns empty list when no defmaps" do
+      source = "(defn add [x :u64 y :u64] :u64 (+ x y))"
+      {cleaned, maps} = Preprocessor.extract_defmaps(source)
+
+      assert cleaned == source
+      assert maps == []
+    end
+
+    test "extracts single defmap" do
+      source = "(defmap counters :hash :u32 :u64 1024)"
+      {cleaned, maps} = Preprocessor.extract_defmaps(source)
+
+      assert String.trim(cleaned) == ""
+      assert length(maps) == 1
+      [md] = maps
+      assert md.name == :counters
+      assert md.map_type == :hash
+      assert md.key_type == :u32
+      assert md.value_type == :u64
+      assert md.max_entries == 1024
+      assert md.index == 0
+    end
+
+    test "extracts multiple defmaps with sequential indices" do
+      source = """
+      (defmap counters :hash :u32 :u64 1024)
+      (defmap data :array :u32 :u32 256)
+      """
+      {_cleaned, maps} = Preprocessor.extract_defmaps(source)
+
+      assert length(maps) == 2
+      assert Enum.at(maps, 0).name == :counters
+      assert Enum.at(maps, 0).index == 0
+      assert Enum.at(maps, 1).name == :data
+      assert Enum.at(maps, 1).index == 1
+    end
+
+    test "removes defmap from source preserving surrounding code" do
+      source = """
+      (defmap counters :hash :u32 :u64 1024)
+      (defn lookup [key :u64] :u64 key)
+      """
+      {cleaned, maps} = Preprocessor.extract_defmaps(source)
+
+      assert length(maps) == 1
+      refute cleaned =~ "defmap"
+      assert cleaned =~ "defn lookup"
+    end
+
+    test "preserves line count after extraction" do
+      source = "(defmap counters :hash :u32 :u64 1024)\n(defn f [x :u64] :u64 x)"
+      {cleaned, _maps} = Preprocessor.extract_defmaps(source)
+
+      # Line count should be preserved
+      assert length(String.split(cleaned, "\n")) == length(String.split(source, "\n"))
+    end
+
+    test "mixed defmap and code" do
+      source = """
+      (defmap counters :hash :u32 :u64 1024)
+      (extern bpf:map_lookup_elem [:u64 :u64] :u64)
+      (defn lookup [key :u64] :u64 key)
+      """
+      {cleaned, maps} = Preprocessor.extract_defmaps(source)
+
+      assert length(maps) == 1
+      assert cleaned =~ "extern"
+      assert cleaned =~ "defn lookup"
+    end
+  end
+
   describe "round-trip: preprocess → parse → normalize" do
     test "simple defn round-trips correctly" do
       source = "(defn add [x :u64 y :u64] :u64 (+ x y))"

@@ -33,11 +33,17 @@ defmodule VaistoBpf.BpfTypeChecker do
   @doc """
   Type-check a normalized parsed AST for BPF compilation.
 
+  Accepts an optional list of `%MapDef{}` structs. Map names are injected
+  into the environment as `:u64` values (map FDs are u64 at the BPF level).
+
   Returns `{:ok, type, typed_ast}` or `{:error, %Vaisto.Error{}}`.
   """
-  @spec check(term()) :: {:ok, term(), term()} | {:error, Error.t()}
-  def check(ast) do
-    check_toplevel(ast, %{})
+  @spec check(term(), [VaistoBpf.MapDef.t()]) :: {:ok, term(), term()} | {:error, Error.t()}
+  def check(ast, maps \\ []) do
+    env = Enum.reduce(maps, %{}, fn md, env ->
+      Map.put(env, md.name, :u64)
+    end)
+    check_toplevel(ast, env)
   end
 
   # ============================================================================

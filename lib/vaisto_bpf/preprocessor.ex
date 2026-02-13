@@ -8,8 +8,12 @@ defmodule VaistoBpf.Preprocessor do
   1. `preprocess_source/1` — text-level: `:u64` → `:U64` before parsing
   2. `normalize_ast/1` — AST-level: `:U64` → `:u64` after parsing
 
+  3. `extract_defmaps/1` — text-level: extract `(defmap ...)` forms before parsing
+
   This keeps all BPF intelligence in vaisto_bpf with zero changes to vaisto core.
   """
+
+  alias VaistoBpf.MapDef
 
   # Maps lowercase BPF type atoms to their capitalized parser-friendly form,
   # and vice versa.
@@ -34,6 +38,46 @@ defmodule VaistoBpf.Preprocessor do
     Regex.replace(@type_pattern, source, fn _full_match, type_name ->
       ":" <> String.upcase(type_name)
     end)
+  end
+
+  # Regex matching (defmap name :type :key :val max_entries)
+  @defmap_pattern ~r/\(defmap\s+(\w+)\s+:(\w+)\s+:(\w+)\s+:(\w+)\s+(\d+)\)/
+
+  @doc """
+  Extract `(defmap ...)` forms from source text before parsing.
+
+  Returns `{cleaned_source, [%MapDef{}]}` where the cleaned source has defmap
+  forms replaced with whitespace (preserving line numbers), and the list
+  contains validated MapDef structs with 0-based indices.
+  """
+  @spec extract_defmaps(String.t()) :: {String.t(), [MapDef.t()]}
+  def extract_defmaps(source) do
+    matches = Regex.scan(@defmap_pattern, source)
+
+    if matches == [] do
+      {source, []}
+    else
+      {cleaned, map_defs, _index} =
+        Enum.reduce(matches, {source, [], 0}, fn
+          [full, name, map_type, key_type, val_type, max_entries], {src, maps, idx} ->
+            # Replace the matched form with spaces (preserve line structure)
+            replacement = String.duplicate(" ", String.length(full))
+            src = String.replace(src, full, replacement, global: false)
+
+            {:ok, md} = MapDef.new(
+              String.to_atom(name),
+              String.to_atom(map_type),
+              String.to_atom(key_type),
+              String.to_atom(val_type),
+              String.to_integer(max_entries),
+              idx
+            )
+
+            {src, [md | maps], idx + 1}
+        end)
+
+      {cleaned, Enum.reverse(map_defs)}
+    end
   end
 
   @doc """

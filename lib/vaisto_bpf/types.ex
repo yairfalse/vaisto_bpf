@@ -292,6 +292,19 @@ defmodule VaistoBpf.Types do
     %__MODULE__{opcode: @bpf_call ||| @bpf_jmp, dst: 0, src: 0, offset: 0, imm: helper_id}
   end
 
+  @doc """
+  LD_IMM64 with pseudo-map-FD (src_reg=1).
+
+  Returns `{insn1, insn2}` — a 16-byte wide instruction pair.
+  The immediate holds the map index; libbpf patches it to the real FD.
+  """
+  def ld_map_fd(dst, map_index) do
+    # Opcode: BPF_LD | BPF_DW | BPF_IMM = 0x18, src_reg=1 for pseudo-map-FD
+    insn1 = %__MODULE__{opcode: @bpf_ld ||| @bpf_dw ||| 0x00, dst: dst, src: 1, offset: 0, imm: map_index}
+    insn2 = %__MODULE__{opcode: 0, dst: 0, src: 0, offset: 0, imm: 0}
+    {insn1, insn2}
+  end
+
   @doc "Store from register to memory: *(size *)(dst + offset) = src"
   def stx_mem(size, dst, src, offset) do
     %__MODULE__{opcode: size ||| @bpf_mem ||| @bpf_stx, dst: dst, src: src, offset: offset, imm: 0}

@@ -43,20 +43,36 @@ defmodule VaistoBpf.Assembler do
 
   @doc """
   Assemble a list of IR nodes into a list of 8-byte BPF instruction binaries.
+
+  Returns `{:ok, instructions, relocations}` where relocations is a list of
+  `{byte_offset, map_index}` tuples for LD_IMM64 map references.
   """
-  @spec assemble([VaistoBpf.IR.instruction()]) :: {:ok, [binary()]} | {:error, Vaisto.Error.t()}
+  @spec assemble([VaistoBpf.IR.instruction()]) ::
+          {:ok, [binary()], [{non_neg_integer(), non_neg_integer()}]}
+          | {:error, Vaisto.Error.t()}
   def assemble(ir) do
-    # Pass 1: Calculate label positions
+    # Pass 1: Calculate label positions (ld_map_fd counts as 2 slots)
     labels = resolve_labels(ir)
 
-    # Pass 2: Emit instructions
-    instructions =
+    # Pass 2: Emit instructions, tracking relocations
+    {instructions, relocations, _pos} =
       ir
       |> Enum.reject(&match?({:label, _}, &1))
-      |> Enum.with_index()
-      |> Enum.map(fn {node, idx} -> emit_instruction(node, idx, labels) end)
+      |> Enum.reduce({[], [], 0}, fn node, {insns, relocs, pos} ->
+        case node do
+          {:ld_map_fd, dst, map_index} ->
+            {insn1, insn2} = Types.ld_map_fd(dst, map_index)
+            byte_offset = pos * 8
+            {[Types.encode(insn2), Types.encode(insn1) | insns],
+             [{byte_offset, map_index} | relocs], pos + 2}
 
-    {:ok, instructions}
+          _ ->
+            bin = emit_instruction(node, pos, labels)
+            {[bin | insns], relocs, pos + 1}
+        end
+      end)
+
+    {:ok, Enum.reverse(instructions), Enum.reverse(relocations)}
   rescue
     e in RuntimeError -> {:error, Vaisto.Error.new(e.message)}
   end
@@ -70,6 +86,10 @@ defmodule VaistoBpf.Assembler do
       Enum.reduce(ir, {%{}, 0}, fn
         {:label, name}, {labels, pos} ->
           {Map.put(labels, name, pos), pos}
+
+        {:ld_map_fd, _dst, _map_index}, {labels, pos} ->
+          # Wide instruction: occupies 2 slots
+          {labels, pos + 2}
 
         _instruction, {labels, pos} ->
           {labels, pos + 1}

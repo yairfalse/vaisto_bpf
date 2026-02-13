@@ -24,11 +24,14 @@ defmodule VaistoBpf.Emitter do
   @doc """
   Emit BPF IR from a typed AST.
 
+  Accepts an optional list of `%MapDef{}` structs. When a variable references
+  a map name, the emitter generates `ld_map_fd` instead of a register lookup.
+
   Returns `{:ok, instructions}` where instructions is a list of IR nodes.
   """
-  @spec emit(term()) :: {:ok, [VaistoBpf.IR.node()]} | {:error, Vaisto.Error.t()}
-  def emit(ast) do
-    ctx = new_context()
+  @spec emit(term(), [VaistoBpf.MapDef.t()]) :: {:ok, [VaistoBpf.IR.node()]} | {:error, Vaisto.Error.t()}
+  def emit(ast, maps \\ []) do
+    ctx = new_context(maps)
 
     try do
       {_reg, ctx} = emit_node(ast, ctx)
@@ -42,12 +45,14 @@ defmodule VaistoBpf.Emitter do
   # Context Management
   # ============================================================================
 
-  defp new_context do
+  defp new_context(maps) do
+    map_lookup = Map.new(maps, fn md -> {md.name, md.index} end)
     %{
       next_reg: Types.r1(),
       next_label: 0,
       vars: %{},
-      instructions: []
+      instructions: [],
+      maps: map_lookup
     }
   end
 
@@ -173,9 +178,18 @@ defmodule VaistoBpf.Emitter do
   # ============================================================================
 
   defp emit_node({:var, name, _type}, ctx) do
-    case Map.fetch(ctx.vars, name) do
-      {:ok, reg} -> {reg, ctx}
-      :error -> raise "unbound variable: #{name}"
+    case Map.fetch(ctx.maps, name) do
+      {:ok, map_index} ->
+        # Map reference: emit LD_IMM64 with pseudo-map-FD
+        {reg, ctx} = alloc_reg(ctx)
+        ctx = push(ctx, {:ld_map_fd, reg, map_index})
+        {reg, ctx}
+
+      :error ->
+        case Map.fetch(ctx.vars, name) do
+          {:ok, reg} -> {reg, ctx}
+          :error -> raise "unbound variable: #{name}"
+        end
     end
   end
 
