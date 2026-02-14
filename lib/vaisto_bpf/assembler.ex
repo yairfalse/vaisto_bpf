@@ -149,6 +149,14 @@ defmodule VaistoBpf.Assembler do
     Types.encode(Types.call_helper(helper_id))
   end
 
+  defp emit_instruction({:ldx_mem, size, dst, src, offset}, _idx, _labels) do
+    Types.encode(Types.ldx_mem(size_to_mem_mode(size), dst, src, offset))
+  end
+
+  defp emit_instruction({:stx_mem, size, dst, src, offset}, _idx, _labels) do
+    Types.encode(Types.stx_mem(size_to_mem_mode(size), dst, src, offset))
+  end
+
   defp emit_instruction(:exit, _idx, _labels) do
     Types.encode(Types.exit_insn())
   end
@@ -159,4 +167,9 @@ defmodule VaistoBpf.Assembler do
 
   defp resolve_alu_op(op), do: Map.fetch!(@alu_op_map, op)
   defp resolve_jmp_op(op), do: Map.fetch!(@jmp_op_map, op)
+
+  defp size_to_mem_mode(:u8), do: Types.mem_b()
+  defp size_to_mem_mode(:u16), do: Types.mem_h()
+  defp size_to_mem_mode(:u32), do: Types.mem_w()
+  defp size_to_mem_mode(:u64), do: Types.mem_dw()
 end

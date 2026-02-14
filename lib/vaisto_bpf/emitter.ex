@@ -285,45 +285,13 @@ defmodule VaistoBpf.Emitter do
     {dst, ctx}
   end
 
-  # BPF helper call: (bpf/ktime_get_ns), (bpf/map_lookup_elem fd key)
+  # BPF qualified call: memory builtins or helper calls
   defp emit_node({:call, {:qualified, :bpf, helper_name}, args, _ret_type}, ctx) do
-    helper_id = VaistoBpf.Helpers.helper_id!(helper_name)
-
-    # 1. Evaluate all args into temporary registers first
-    {arg_regs, ctx} =
-      Enum.map_reduce(args, ctx, fn arg, ctx ->
-        emit_node(arg, ctx)
-      end)
-
-    # 2. Spill any live variables in r1-r5 to callee-saved regs (r6-r9)
-    {ctx, restore_map} = spill_caller_saved(ctx)
-
-    # 3. Remap arg_regs: if an arg was in a spilled register, read from
-    #    the callee-saved copy instead (avoids register-move cycle bugs)
-    arg_regs = Enum.map(arg_regs, fn reg -> Map.get(restore_map, reg, reg) end)
-
-    # 4. Move evaluated args to r1-r5 (BPF calling convention)
-    ctx =
-      arg_regs
-      |> Enum.with_index(Types.r1())
-      |> Enum.reduce(ctx, fn {src_reg, dst_reg}, ctx ->
-        if src_reg == dst_reg, do: ctx, else: push(ctx, {:mov_reg, dst_reg, src_reg})
-      end)
-
-    # 5. Emit call
-    ctx = push(ctx, {:call, helper_id})
-
-    # 6. Copy result from r0 to an allocated register
-    {result_reg, ctx} = alloc_reg(ctx)
-    ctx = push(ctx, {:mov_reg, result_reg, Types.r0()})
-
-    # 7. Reclaim clobbered caller-saved registers.
-    #    After the call, r1-r5 are dead. Variables have been rebound to
-    #    callee-saved regs (r6-r9). Reset next_reg to just past the
-    #    highest register still in use, so future allocations can reuse r1-r5.
-    ctx = reclaim_registers(ctx, result_reg)
-
-    {result_reg, ctx}
+    case memory_builtin(helper_name) do
+      {:load, size} -> emit_load(size, args, ctx)
+      {:store, size} -> emit_store(size, args, ctx)
+      nil -> emit_helper_call(helper_name, args, ctx)
+    end
   end
 
   # Generic call (catch-all for builtins we don't special-case)
@@ -336,7 +304,6 @@ defmodule VaistoBpf.Emitter do
 
     {last_reg, ctx}
   end
-
 
   # ============================================================================
   # Control Flow
@@ -448,6 +415,91 @@ defmodule VaistoBpf.Emitter do
   defp emit_pattern_check(_pattern, _expr_reg, _fail_label, ctx) do
     # Catch-all: skip pattern check (will match anything)
     ctx
+  end
+
+  # ============================================================================
+  # Memory Access Builtins (inline LDX_MEM / STX_MEM)
+  # ============================================================================
+
+  @memory_load_builtins %{
+    load_u8: :u8, load_u16: :u16, load_u32: :u32, load_u64: :u64
+  }
+
+  @memory_store_builtins %{
+    store_u8: :u8, store_u16: :u16, store_u32: :u32, store_u64: :u64
+  }
+
+  defp memory_builtin(name) do
+    cond do
+      size = Map.get(@memory_load_builtins, name) -> {:load, size}
+      size = Map.get(@memory_store_builtins, name) -> {:store, size}
+      true -> nil
+    end
+  end
+
+  defp emit_load(size, [ptr_expr, offset_expr], ctx) do
+    {ptr_reg, ctx} = emit_node(ptr_expr, ctx)
+    offset = extract_literal_offset!(offset_expr)
+    {dst, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:ldx_mem, size, dst, ptr_reg, offset})
+    {dst, ctx}
+  end
+
+  defp emit_store(size, [ptr_expr, offset_expr, val_expr], ctx) do
+    {ptr_reg, ctx} = emit_node(ptr_expr, ctx)
+    offset = extract_literal_offset!(offset_expr)
+    {val_reg, ctx} = emit_node(val_expr, ctx)
+    ctx = push(ctx, {:stx_mem, size, ptr_reg, val_reg, offset})
+    {ptr_reg, ctx}
+  end
+
+  defp extract_literal_offset!({:lit, :int, value}) when is_integer(value), do: value
+  defp extract_literal_offset!(other) do
+    raise "memory access offset must be a compile-time literal, got: #{inspect(other)}"
+  end
+
+  # ============================================================================
+  # BPF Helper Call Emission
+  # ============================================================================
+
+  defp emit_helper_call(helper_name, args, ctx) do
+    helper_id = VaistoBpf.Helpers.helper_id!(helper_name)
+
+    # 1. Evaluate all args into temporary registers first
+    {arg_regs, ctx} =
+      Enum.map_reduce(args, ctx, fn arg, ctx ->
+        emit_node(arg, ctx)
+      end)
+
+    # 2. Spill any live variables in r1-r5 to callee-saved regs (r6-r9)
+    {ctx, restore_map} = spill_caller_saved(ctx)
+
+    # 3. Remap arg_regs: if an arg was in a spilled register, read from
+    #    the callee-saved copy instead (avoids register-move cycle bugs)
+    arg_regs = Enum.map(arg_regs, fn reg -> Map.get(restore_map, reg, reg) end)
+
+    # 4. Move evaluated args to r1-r5 (BPF calling convention)
+    ctx =
+      arg_regs
+      |> Enum.with_index(Types.r1())
+      |> Enum.reduce(ctx, fn {src_reg, dst_reg}, ctx ->
+        if src_reg == dst_reg, do: ctx, else: push(ctx, {:mov_reg, dst_reg, src_reg})
+      end)
+
+    # 5. Emit call
+    ctx = push(ctx, {:call, helper_id})
+
+    # 6. Copy result from r0 to an allocated register
+    {result_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:mov_reg, result_reg, Types.r0()})
+
+    # 7. Reclaim clobbered caller-saved registers.
+    #    After the call, r1-r5 are dead. Variables have been rebound to
+    #    callee-saved regs (r6-r9). Reset next_reg to just past the
+    #    highest register still in use, so future allocations can reuse r1-r5.
+    ctx = reclaim_registers(ctx, result_reg)
+
+    {result_reg, ctx}
   end
 
   # ============================================================================

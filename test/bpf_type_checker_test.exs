@@ -203,6 +203,43 @@ defmodule VaistoBpf.BpfTypeCheckerTest do
     end
   end
 
+  describe "memory access builtins" do
+    test "bpf/load_u64 type-checks without extern" do
+      ast = parse_bpf("(defn read_val [ptr :u64] :u64 (bpf/load_u64 ptr 0))")
+      assert {:ok, _, _} = BpfTypeChecker.check(ast)
+    end
+
+    test "bpf/store_u32 type-checks correctly" do
+      ast = parse_bpf("(defn write_val [ptr :u64 val :u32] :unit (bpf/store_u32 ptr 4 val))")
+      assert {:ok, _, _} = BpfTypeChecker.check(ast)
+    end
+
+    test "bpf/load_u32 returns u32" do
+      ast = parse_bpf("(defn read32 [ptr :u64] :u32 (bpf/load_u32 ptr 8))")
+      assert {:ok, {:fn, [:u64], :u32}, _} = BpfTypeChecker.check(ast)
+    end
+
+    test "wrong argument count is rejected" do
+      ast = parse_bpf("(defn bad [ptr :u64] :u64 (bpf/load_u64 ptr))")
+      assert {:error, %Error{message: msg}} = BpfTypeChecker.check(ast)
+      assert msg =~ "expects 2 arguments"
+    end
+
+    test "all load sizes type-check" do
+      for {size, ret} <- [{"u64", "u64"}, {"u32", "u32"}, {"u16", "u16"}, {"u8", "u8"}] do
+        ast = parse_bpf("(defn f [ptr :u64] :#{ret} (bpf/load_#{size} ptr 0))")
+        assert {:ok, _, _} = BpfTypeChecker.check(ast), "load_#{size} should pass"
+      end
+    end
+
+    test "all store sizes type-check" do
+      for size <- ["u64", "u32", "u16", "u8"] do
+        ast = parse_bpf("(defn f [ptr :u64 val :#{size}] :unit (bpf/store_#{size} ptr 0 val))")
+        assert {:ok, _, _} = BpfTypeChecker.check(ast), "store_#{size} should pass"
+      end
+    end
+  end
+
   describe "deftype" do
     test "record with BPF fields passes" do
       ast = parse_bpf("""

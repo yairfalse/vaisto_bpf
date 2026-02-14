@@ -43,7 +43,26 @@ defmodule VaistoBpf.BpfTypeChecker do
     env = Enum.reduce(maps, %{}, fn md, env ->
       Map.put(env, md.name, :u64)
     end)
+    env = inject_memory_builtins(env)
     check_toplevel(ast, env)
+  end
+
+  # Memory access builtins — injected automatically, no extern needed
+  @memory_builtins [
+    {:load_u64,  {:fn, [:u64, :u64], :u64}},
+    {:load_u32,  {:fn, [:u64, :u64], :u32}},
+    {:load_u16,  {:fn, [:u64, :u64], :u16}},
+    {:load_u8,   {:fn, [:u64, :u64], :u8}},
+    {:store_u64, {:fn, [:u64, :u64, :u64], :unit}},
+    {:store_u32, {:fn, [:u64, :u64, :u32], :unit}},
+    {:store_u16, {:fn, [:u64, :u64, :u16], :unit}},
+    {:store_u8,  {:fn, [:u64, :u64, :u8], :unit}},
+  ]
+
+  defp inject_memory_builtins(env) do
+    Enum.reduce(@memory_builtins, env, fn {name, fn_type}, env ->
+      Map.put(env, {:qualified, :bpf, name}, fn_type)
+    end)
   end
 
   # ============================================================================

@@ -22,6 +22,8 @@ defmodule VaistoBpf.IR do
           | {:label, label()}
           | {:call, non_neg_integer()}
           | {:ld_map_fd, register(), non_neg_integer()}
+          | {:ldx_mem, atom(), register(), register(), integer()}
+          | {:stx_mem, atom(), register(), register(), integer()}
           | :exit
 
   @type program :: [instruction()]

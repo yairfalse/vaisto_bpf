@@ -166,6 +166,70 @@ defmodule VaistoBpf.AssemblerTest do
     end
   end
 
+  describe "memory access instructions" do
+    test "ldx_mem u64 encodes correctly" do
+      ir = [{:ldx_mem, :u64, 1, 2, 0}]
+      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+
+      decoded = Types.decode(binary)
+      # LDX | MEM | DW = 0x01 | 0x60 | 0x18 = 0x79
+      assert decoded.opcode == 0x79
+      assert decoded.dst == 1
+      assert decoded.src == 2
+      assert decoded.offset == 0
+    end
+
+    test "stx_mem u32 encodes correctly" do
+      ir = [{:stx_mem, :u32, 3, 4, 8}]
+      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+
+      decoded = Types.decode(binary)
+      # STX | MEM | W = 0x03 | 0x60 | 0x00 = 0x63
+      assert decoded.opcode == 0x63
+      assert decoded.dst == 3
+      assert decoded.src == 4
+      assert decoded.offset == 8
+    end
+
+    test "all sizes encode to correct opcodes" do
+      sizes_and_opcodes = [
+        {:u8,  0x71, 0x73},  # LDX|MEM|B, STX|MEM|B
+        {:u16, 0x69, 0x6B},  # LDX|MEM|H, STX|MEM|H
+        {:u32, 0x61, 0x63},  # LDX|MEM|W, STX|MEM|W
+        {:u64, 0x79, 0x7B},  # LDX|MEM|DW, STX|MEM|DW
+      ]
+
+      for {size, ldx_op, stx_op} <- sizes_and_opcodes do
+        {:ok, [ldx_bin], _} = Assembler.assemble([{:ldx_mem, size, 0, 1, 0}])
+        {:ok, [stx_bin], _} = Assembler.assemble([{:stx_mem, size, 0, 1, 0}])
+
+        assert Types.decode(ldx_bin).opcode == ldx_op, "ldx #{size} expected 0x#{Integer.to_string(ldx_op, 16)}"
+        assert Types.decode(stx_bin).opcode == stx_op, "stx #{size} expected 0x#{Integer.to_string(stx_op, 16)}"
+      end
+    end
+
+    test "negative offset works" do
+      ir = [{:ldx_mem, :u64, 1, 10, -8}]
+      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+
+      decoded = Types.decode(binary)
+      assert decoded.offset == -8
+      assert decoded.src == 10
+    end
+
+    test "memory instructions are single-slot (8 bytes)" do
+      ir = [
+        {:ldx_mem, :u64, 1, 2, 0},
+        {:stx_mem, :u32, 3, 4, 16},
+        :exit
+      ]
+
+      {:ok, instructions, _relocs} = Assembler.assemble(ir)
+      assert length(instructions) == 3
+      assert Enum.all?(instructions, &(byte_size(&1) == 8))
+    end
+  end
+
   describe "encode/decode roundtrip" do
     test "instruction survives encode→decode" do
       insn = %Types{opcode: 0xB7, dst: 1, src: 0, offset: 0, imm: 42}

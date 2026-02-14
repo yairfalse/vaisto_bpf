@@ -185,6 +185,44 @@ defmodule VaistoBpf.EmitterTest do
     end
   end
 
+  describe "memory access builtins" do
+    test "load_u64 generates ldx_mem" do
+      ast = {:call, {:qualified, :bpf, :load_u64},
+        [{:var, :ptr, :u64}, {:lit, :int, 0}], :u64}
+      ctx_ast = wrap_in_fn(:read, [:ptr], ast, [:u64], :u64)
+      {:ok, ir} = Emitter.emit(ctx_ast)
+
+      assert Enum.any?(ir, &match?({:ldx_mem, :u64, _, _, 0}, &1))
+    end
+
+    test "store_u32 generates stx_mem" do
+      ast = {:call, {:qualified, :bpf, :store_u32},
+        [{:var, :ptr, :u64}, {:lit, :int, 8}, {:var, :val, :u32}], :unit}
+      ctx_ast = wrap_in_fn(:write, [:ptr, :val], ast, [:u64, :u32], :unit)
+      {:ok, ir} = Emitter.emit(ctx_ast)
+
+      assert Enum.any?(ir, &match?({:stx_mem, :u32, _, _, 8}, &1))
+    end
+
+    test "load with non-zero offset" do
+      ast = {:call, {:qualified, :bpf, :load_u32},
+        [{:var, :ptr, :u64}, {:lit, :int, 16}], :u32}
+      ctx_ast = wrap_in_fn(:read_field, [:ptr], ast, [:u64], :u32)
+      {:ok, ir} = Emitter.emit(ctx_ast)
+
+      assert Enum.any?(ir, &match?({:ldx_mem, :u32, _, _, 16}, &1))
+    end
+
+    test "non-literal offset raises error" do
+      ast = {:call, {:qualified, :bpf, :load_u64},
+        [{:var, :ptr, :u64}, {:var, :off, :u64}], :u64}
+      ctx_ast = wrap_in_fn(:bad, [:ptr, :off], ast, [:u64, :u64], :u64)
+
+      assert {:error, %Vaisto.Error{message: msg}} = Emitter.emit(ctx_ast)
+      assert msg =~ "compile-time literal"
+    end
+  end
+
   # Helper: wrap a body expression in a function definition
   defp wrap_in_fn(name, params, body, arg_types, ret_type) do
     {:defn, name, params, body, {:fn, arg_types, ret_type}}
