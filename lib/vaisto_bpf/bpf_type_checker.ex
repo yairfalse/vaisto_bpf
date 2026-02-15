@@ -57,6 +57,10 @@ defmodule VaistoBpf.BpfTypeChecker do
     {:store_u32, {:fn, [:u64, :u64, :u32], :unit}},
     {:store_u16, {:fn, [:u64, :u64, :u16], :unit}},
     {:store_u8,  {:fn, [:u64, :u64, :u8], :unit}},
+    {:stack_store_u64, {:fn, [:u64, :u64], :unit}},
+    {:stack_store_u32, {:fn, [:u64, :u32], :unit}},
+    {:stack_load_u64,  {:fn, [:u64], :u64}},
+    {:stack_load_u32,  {:fn, [:u64], :u32}},
   ]
 
   defp inject_memory_builtins(env) do

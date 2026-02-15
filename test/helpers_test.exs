@@ -40,6 +40,24 @@ defmodule VaistoBpf.HelpersTest do
     end
   end
 
+  describe "ptr_args/1" do
+    test "map_lookup_elem needs key as stack pointer" do
+      assert [1] = Helpers.ptr_args(:map_lookup_elem)
+    end
+
+    test "map_update_elem needs key and value as stack pointers" do
+      assert [1, 2] = Helpers.ptr_args(:map_update_elem)
+    end
+
+    test "ktime_get_ns has no pointer args" do
+      assert [] = Helpers.ptr_args(:ktime_get_ns)
+    end
+
+    test "unknown helper returns empty list" do
+      assert [] = Helpers.ptr_args(:nonexistent)
+    end
+  end
+
   describe "known?/1" do
     test "true for known helpers" do
       assert Helpers.known?(:ktime_get_ns)
