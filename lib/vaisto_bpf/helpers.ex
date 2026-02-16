@@ -21,6 +21,10 @@ defmodule VaistoBpf.Helpers do
     get_smp_processor_id:   {8,  [], :u32,                           []},
     get_current_pid_tgid:   {14, [], :u64,                           []},
     get_current_uid_gid:    {15, [], :u64,                           []},
+    ringbuf_output:         {130, [:u64, :u64, :u64, :u64], :u64,  []},
+    ringbuf_reserve:        {131, [:u64, :u64, :u64], {:ptr, :u8}, []},
+    ringbuf_submit:         {132, [:u64, :u64], :u64,              []},
+    ringbuf_discard:        {133, [:u64, :u64], :u64,              []},
   }
 
   @doc "Returns the integer helper ID for the given name, or `{:error, msg}`."

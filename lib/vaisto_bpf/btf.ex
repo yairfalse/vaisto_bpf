@@ -95,10 +95,13 @@ defmodule VaistoBpf.BTF do
   # We deduplicate the INT types across all maps.
 
   defp build_types(map_defs, str_tab) do
-    # Collect unique int types needed
+    # Collect unique int types needed (filter :none and record names)
     int_types_needed =
       map_defs
       |> Enum.flat_map(fn md -> [md.key_type, md.value_type, :u32] end)
+      |> Enum.reject(fn t ->
+        t == :none or (is_atom(t) and Atom.to_string(t) =~ ~r/^[A-Z]/)
+      end)
       |> Enum.uniq()
 
     # Type IDs start at 1 (0 is void)
@@ -119,8 +122,8 @@ defmodule VaistoBpf.BTF do
     {map_bins, str_tab, next_id, var_type_ids} =
       Enum.reduce(map_defs, {<<>>, str_tab, next_id, []}, fn md, {bin, stab, nid, var_ids} ->
         u32_type_id = Map.fetch!(int_type_map, :u32)
-        key_type_id = Map.fetch!(int_type_map, md.key_type)
-        value_type_id = Map.fetch!(int_type_map, md.value_type)
+        key_type_id = Map.get(int_type_map, md.key_type, 0)
+        value_type_id = Map.get(int_type_map, md.value_type, 0)
 
         # ARRAY for "type" field: element=u32, nelems=map_type_id
         type_array_id = nid

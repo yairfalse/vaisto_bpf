@@ -40,8 +40,51 @@ defmodule VaistoBpf.Preprocessor do
     end)
   end
 
-  # Regex matching (defmap name :type :key :val max_entries)
-  @defmap_pattern ~r/\(defmap\s+(\w+)\s+:(\w+)\s+:(\w+)\s+:(\w+)\s+(\d+)\)/
+  # Regex matching (program :type) or (program :type "attach_point")
+  @program_pattern ~r/\(program\s+:(\w+)(?:\s+"([^"]*)")?\)/
+
+  @supported_program_types ~w(kprobe kretprobe uprobe uretprobe xdp tc
+    tracepoint raw_tracepoint socket_filter cgroup_skb)
+
+  @doc """
+  Extract `(program ...)` annotation from source text.
+
+  Returns `{cleaned_source, section_name | nil}` where section_name is
+  the ELF section name derived from the program type and optional attach point.
+  """
+  @spec extract_program(String.t()) :: {String.t(), String.t() | nil}
+  def extract_program(source) do
+    case Regex.run(@program_pattern, source) do
+      [full, prog_type, attach_point] ->
+        if prog_type in @supported_program_types do
+          replacement = String.duplicate(" ", String.length(full))
+          cleaned = String.replace(source, full, replacement, global: false)
+          {cleaned, build_section_name(prog_type, attach_point)}
+        else
+          raise "unsupported program type: #{prog_type}"
+        end
+
+      [full, prog_type] ->
+        if prog_type in @supported_program_types do
+          replacement = String.duplicate(" ", String.length(full))
+          cleaned = String.replace(source, full, replacement, global: false)
+          {cleaned, build_section_name(prog_type, nil)}
+        else
+          raise "unsupported program type: #{prog_type}"
+        end
+
+      nil ->
+        {source, nil}
+    end
+  end
+
+  defp build_section_name(prog_type, nil), do: prog_type
+  defp build_section_name(prog_type, ""), do: prog_type
+  defp build_section_name(prog_type, attach_point), do: "#{prog_type}/#{attach_point}"
+
+  # Regex matching (defmap name :type :key/:val max_entries)
+  # Supports both :atom types and bare 0 (for ringbuf)
+  @defmap_pattern ~r/\(defmap\s+(\w+)\s+:(\w+)\s+:?(\w+)\s+:?(\w+)\s+(\d+)\)/
 
   @doc """
   Extract `(defmap ...)` forms from source text before parsing.
@@ -67,8 +110,8 @@ defmodule VaistoBpf.Preprocessor do
             {:ok, md} = MapDef.new(
               String.to_atom(name),
               String.to_atom(map_type),
-              String.to_atom(key_type),
-              String.to_atom(val_type),
+              parse_defmap_type(key_type),
+              parse_defmap_type(val_type),
               String.to_integer(max_entries),
               idx
             )
@@ -123,6 +166,17 @@ defmodule VaistoBpf.Preprocessor do
 
   def normalize_ast({:deftype, name, fields, loc}) do
     {:deftype, name, normalize_fields(fields), loc}
+  end
+
+  # for-range: normalize to dedicated AST node
+  def normalize_ast({:call, :"for-range", [var, start, end_expr, body], loc}) do
+    {:for_range, normalize_ast(var), normalize_ast(start), normalize_ast(end_expr),
+     normalize_ast(body), loc}
+  end
+
+  # field_access: normalize sub-expression
+  def normalize_ast({:field_access, expr, field, loc}) do
+    {:field_access, normalize_ast(expr), field, loc}
   end
 
   # call: normalize function, args, and any type-like elements
@@ -226,6 +280,10 @@ defmodule VaistoBpf.Preprocessor do
   defp unwrap_and_normalize({:atom, val}), do: normalize_type_atom(val)
   defp unwrap_and_normalize(atom) when is_atom(atom), do: normalize_type_atom(atom)
   defp unwrap_and_normalize(other), do: other
+
+  # Parse defmap type field: "0" → :none, other → atom
+  defp parse_defmap_type("0"), do: :none
+  defp parse_defmap_type(s), do: String.to_atom(s)
 
   # The core atom normalization: :U64 → :u64, :I32 → :i32, etc.
   defp normalize_type_atom(atom) when is_atom(atom) do
