@@ -85,7 +85,9 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       assert {:ok, instructions} = VaistoBpf.compile_source(source)
       assert is_list(instructions)
@@ -116,7 +118,9 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
       header = parse_elf_header(elf)
@@ -168,7 +172,9 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
 
@@ -186,7 +192,9 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
 
@@ -213,7 +221,9 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       {:ok, instructions} = VaistoBpf.compile_source(source)
 
@@ -314,8 +324,13 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap data :array :u32 :u64 256)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn sum_lookups [key :u64] :u64
-        (+ (bpf/map_lookup_elem counters key)
-           (bpf/map_lookup_elem data key)))
+        (let [a (match (bpf/map_lookup_elem counters key)
+                  [(Some v) (bpf/load_u64 v 0)]
+                  [(None) 0])]
+          (let [b (match (bpf/map_lookup_elem data key)
+                    [(Some v) (bpf/load_u64 v 0)]
+                    [(None) 0])]
+            (+ a b))))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
 
@@ -330,9 +345,13 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap data :array :u32 :u64 256)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup_counter [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       (defn lookup_data [key :u64] :u64
-        (bpf/map_lookup_elem data key))
+        (match (bpf/map_lookup_elem data key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
 
@@ -353,7 +372,9 @@ defmodule VaistoBpf.MapIntegrationTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [key :u64] :u64
-        (bpf/map_lookup_elem counters key))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
       header = parse_elf_header(elf)

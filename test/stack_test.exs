@@ -30,7 +30,9 @@ defmodule VaistoBpf.StackTest do
       instructions = compile!("""
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [fd :u64 key :u64] :u64
-        (bpf/map_lookup_elem fd key))
+        (match (bpf/map_lookup_elem fd key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """)
 
       # Should have STX_MEM DW to r10 (store key to stack)
@@ -44,7 +46,9 @@ defmodule VaistoBpf.StackTest do
       instructions = compile!("""
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [fd :u64 key :u64] :u64
-        (bpf/map_lookup_elem fd key))
+        (match (bpf/map_lookup_elem fd key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """)
 
       stx_idx = Enum.find_index(instructions, fn insn ->
@@ -61,7 +65,9 @@ defmodule VaistoBpf.StackTest do
       instructions = compile!("""
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [fd :u64 key :u64] :u64
-        (bpf/map_lookup_elem fd key))
+        (match (bpf/map_lookup_elem fd key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """)
 
       # After STX_MEM, should have MOV rN, r10 then ADD rN, <negative>
@@ -254,8 +260,9 @@ defmodule VaistoBpf.StackTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn get_counter [key :u64] :u64
-        (let [ptr (bpf/map_lookup_elem counters key)]
-          (bpf/load_u64 ptr 0)))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some ptr) (bpf/load_u64 ptr 0)]
+          [(None) 0]))
       """
       {:ok, instructions} = VaistoBpf.compile_source(source)
       decoded = Enum.map(instructions, &decode/1)
@@ -282,8 +289,9 @@ defmodule VaistoBpf.StackTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn get_counter [key :u64] :u64
-        (let [ptr (bpf/map_lookup_elem counters key)]
-          (bpf/load_u64 ptr 0)))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some ptr) (bpf/load_u64 ptr 0)]
+          [(None) 0]))
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
 
@@ -332,7 +340,9 @@ defmodule VaistoBpf.StackTest do
       source = """
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [fd :u64 key :u64] :u64
-        (bpf/map_lookup_elem fd key))
+        (match (bpf/map_lookup_elem fd key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """
       assert {:ok, _} = VaistoBpf.compile_source(source)
     end

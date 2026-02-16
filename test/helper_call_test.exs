@@ -60,7 +60,9 @@ defmodule VaistoBpf.HelperCallTest do
       instructions = compile!("""
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn lookup [fd :u64 key :u64] :u64
-        (bpf/map_lookup_elem fd key))
+        (match (bpf/map_lookup_elem fd key)
+          [(Some v) (bpf/load_u64 v 0)]
+          [(None) 0]))
       """)
 
       call_insn = Enum.find(instructions, &(&1.opcode == @call_opcode))

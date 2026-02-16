@@ -445,6 +445,17 @@ defmodule VaistoBpf.Emitter do
     bind_var(ctx, name, expr_reg)
   end
 
+  # Some pattern: non-null check — if ptr == 0, jump to next clause
+  defp emit_pattern_check({:some_pattern, {:var, name, _type}}, expr_reg, fail_label, ctx) do
+    ctx = push(ctx, {:jmp_imm, :jeq, expr_reg, 0, fail_label})
+    bind_var(ctx, name, expr_reg)
+  end
+
+  # None pattern: null check — if ptr != 0, jump to next clause
+  defp emit_pattern_check(:none_pattern, expr_reg, fail_label, ctx) do
+    push(ctx, {:jmp_imm, :jne, expr_reg, 0, fail_label})
+  end
+
   defp emit_pattern_check(:_, _expr_reg, _fail_label, ctx) do
     # Wildcard — always matches
     ctx

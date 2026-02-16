@@ -129,8 +129,9 @@ defmodule VaistoBpf.MemoryAccessTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn get_counter [key :u64] :u64
-        (let [ptr (bpf/map_lookup_elem counters key)]
-          (bpf/load_u64 ptr 0)))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some ptr) (bpf/load_u64 ptr 0)]
+          [(None) 0]))
       """
 
       {:ok, instructions} = VaistoBpf.compile_source(source)
@@ -147,9 +148,10 @@ defmodule VaistoBpf.MemoryAccessTest do
       source = """
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
-      (defn set_counter [key :u64 val :u64] :unit
-        (let [ptr (bpf/map_lookup_elem counters key)]
-          (bpf/store_u64 ptr 0 val)))
+      (defn set_counter [key :u64 val :u64] :u64
+        (match (bpf/map_lookup_elem counters key)
+          [(Some ptr) (do (bpf/store_u64 ptr 0 val) 1)]
+          [(None) 0]))
       """
 
       {:ok, instructions} = VaistoBpf.compile_source(source)
@@ -185,8 +187,9 @@ defmodule VaistoBpf.MemoryAccessTest do
       (defmap counters :hash :u32 :u64 1024)
       (extern bpf:map_lookup_elem [:u64 :u64] :u64)
       (defn get_counter [key :u64] :u64
-        (let [ptr (bpf/map_lookup_elem counters key)]
-          (bpf/load_u64 ptr 0)))
+        (match (bpf/map_lookup_elem counters key)
+          [(Some ptr) (bpf/load_u64 ptr 0)]
+          [(None) 0]))
       """
 
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)

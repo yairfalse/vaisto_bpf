@@ -104,9 +104,14 @@ defmodule VaistoBpf.BpfTypeChecker do
     collect_signatures(rest, Map.put(env, name, fn_type))
   end
 
-  # 6-element extern: collect into env so functions can reference helpers
+  # 6-element extern: collect into env so functions can reference helpers.
+  # If the helper is known in the registry, override the return type (e.g., {:ptr, T}).
   defp collect_signatures([{:extern, mod, name, arg_types, ret_type, _loc} | rest], env) do
-    fn_type = {:fn, arg_types, ret_type}
+    actual_ret = case VaistoBpf.Helpers.helper_type(name) do
+      {:ok, {:fn, _, registry_ret}} -> registry_ret
+      _ -> ret_type
+    end
+    fn_type = {:fn, arg_types, actual_ret}
     env = env
           |> Map.put(name, fn_type)
           |> Map.put({:qualified, mod, name}, fn_type)
@@ -144,11 +149,16 @@ defmodule VaistoBpf.BpfTypeChecker do
     {:ok, :unit, {:import, mod, als}, env}
   end
 
-  # extern with separate arg_types and ret_type (6-element from preprocessor)
+  # extern with separate arg_types and ret_type (6-element from preprocessor).
+  # If the helper is known in the registry, override the return type (e.g., {:ptr, T}).
   defp check_form({:extern, mod, name, arg_types, ret_type, _loc}, env) do
-    with :ok <- validate_bpf_type(ret_type),
+    actual_ret = case VaistoBpf.Helpers.helper_type(name) do
+      {:ok, {:fn, _, registry_ret}} -> registry_ret
+      _ -> ret_type
+    end
+    with :ok <- validate_bpf_type(actual_ret),
          :ok <- validate_type_list(arg_types) do
-      fn_type = {:fn, arg_types, ret_type}
+      fn_type = {:fn, arg_types, actual_ret}
       # Store both as bare name and as qualified key for lookup in calls
       env = env
             |> Map.put(name, fn_type)
@@ -525,7 +535,21 @@ defmodule VaistoBpf.BpfTypeChecker do
           # All clauses done — verify they all have the same type
           result_type = body_type
           clauses = Enum.reverse(new_acc)
-          {:ok, result_type, {:match, typed_scrutinee, clauses, result_type}}
+
+          # Exhaustiveness check for nullable pointer types
+          if match?({:ptr, _}, scrut_type) do
+            patterns = Enum.map(clauses, fn {p, _, _} -> p end)
+            has_some = Enum.any?(patterns, &match?({:some_pattern, _}, &1))
+            has_none = Enum.any?(patterns, &match?(:none_pattern, &1))
+
+            if has_some and has_none do
+              {:ok, result_type, {:match, typed_scrutinee, clauses, result_type}}
+            else
+              {:error, Error.new("non-exhaustive match on nullable pointer: must handle both (Some v) and (None)")}
+            end
+          else
+            {:ok, result_type, {:match, typed_scrutinee, clauses, result_type}}
+          end
         else
           check_match_clauses(rest, scrut_type, env, expected || body_type, typed_scrutinee, new_acc)
         end
@@ -616,6 +640,16 @@ defmodule VaistoBpf.BpfTypeChecker do
     {env, {:var, :_, type}}
   end
 
+  # (Some var) on {:ptr, T} — bind var to inner type T (non-null path)
+  defp bind_pattern({:call, :Some, [var], _loc}, {:ptr, inner_type}, env) when is_atom(var) do
+    {Map.put(env, var, inner_type), {:some_pattern, {:var, var, inner_type}}}
+  end
+
+  # (None) on {:ptr, _} — null path, no binding
+  defp bind_pattern({:call, :None, [], _loc}, {:ptr, _inner_type}, env) do
+    {env, :none_pattern}
+  end
+
   defp bind_pattern(other, _type, env) do
     {env, other}
   end
@@ -633,6 +667,7 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp resolve_int_context(_), do: :no_context
 
   defp types_compatible?(a, a), do: true
+  defp types_compatible?({:ptr, a}, {:ptr, a}), do: true
   defp types_compatible?(_, _), do: false
 
   defp pick_concrete(a, _b), do: a
@@ -658,6 +693,8 @@ defmodule VaistoBpf.BpfTypeChecker do
       end)
     end
   end
+
+  defp validate_bpf_type({:ptr, inner}), do: validate_bpf_type(inner)
 
   defp validate_bpf_type({:record, _name, fields}), do: validate_fields(fields)
 
@@ -707,6 +744,7 @@ defmodule VaistoBpf.BpfTypeChecker do
     args_str = Enum.map_join(args, " ", &format_type/1)
     "(fn [#{args_str}] #{format_type(ret)})"
   end
+  defp format_type({:ptr, inner}), do: "(Ptr #{format_type(inner)})"
   defp format_type({:record, name, _fields}), do: "#{name}"
   defp format_type(other), do: inspect(other)
 end

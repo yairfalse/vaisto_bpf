@@ -30,7 +30,7 @@ defmodule VaistoBpf.HelpersTest do
   describe "helper_type/1" do
     test "returns function types for known helpers" do
       assert {:ok, {:fn, [], :u64}} = Helpers.helper_type(:ktime_get_ns)
-      assert {:ok, {:fn, [:u64, :u64], :u64}} = Helpers.helper_type(:map_lookup_elem)
+      assert {:ok, {:fn, [:u64, :u64], {:ptr, :u64}}} = Helpers.helper_type(:map_lookup_elem)
       assert {:ok, {:fn, [:u64, :u64, :u64, :u64], :u64}} = Helpers.helper_type(:map_update_elem)
       assert {:ok, {:fn, [], :u32}} = Helpers.helper_type(:get_smp_processor_id)
     end

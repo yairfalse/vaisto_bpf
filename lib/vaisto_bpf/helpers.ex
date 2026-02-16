@@ -12,7 +12,7 @@ defmodule VaistoBpf.Helpers do
   # {id, arg_types, ret_type, ptr_args}
   # ptr_args: 0-based indices of args that must be passed as stack pointers
   @helpers %{
-    map_lookup_elem:        {1,  [:u64, :u64], :u64,                [1]},
+    map_lookup_elem:        {1,  [:u64, :u64], {:ptr, :u64},         [1]},
     map_update_elem:        {2,  [:u64, :u64, :u64, :u64], :u64,   [1, 2]},
     map_delete_elem:        {3,  [:u64, :u64], :u64,                [1]},
     probe_read:             {4,  [:u64, :u64, :u64], :u64,          []},
