@@ -82,8 +82,11 @@ defmodule VaistoBpf.Preprocessor do
   defp build_section_name(prog_type, ""), do: prog_type
   defp build_section_name(prog_type, attach_point), do: "#{prog_type}/#{attach_point}"
 
-  # Regex matching (defmap name :type :key/:val max_entries)
-  # Supports both :atom types and bare 0 (for ringbuf)
+  # Regex matching (defmap name :type key val max_entries).
+  # The colon is optional on key/val independently (:? prefix) to support both
+  # normal maps `(defmap m :hash :u32 :u64 1024)` and ring buffers with bare 0
+  # `(defmap events :ringbuf 0 0 4096)`. Mixed forms like `:u32 0` are accepted
+  # by the regex but rejected downstream by MapDef.new/6 validation.
   @defmap_pattern ~r/\(defmap\s+(\w+)\s+:(\w+)\s+:?(\w+)\s+:?(\w+)\s+(\d+)\)/
 
   @doc """

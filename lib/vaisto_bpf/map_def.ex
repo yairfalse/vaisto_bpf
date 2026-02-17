@@ -2,8 +2,11 @@ defmodule VaistoBpf.MapDef do
   @moduledoc """
   BPF map definition — parsed from `(defmap name :type :key :val max_entries)`.
 
-  Each MapDef captures the map's name, type (hash/array), key and value types,
+  Each MapDef captures the map's name, type (hash/array/ringbuf), key and value types,
   maximum entries, and its zero-based index (used for relocations).
+
+  Ring buffers use `:none` for key_type and value_type (sizes are 0).
+  Record type names (capitalized atoms like `:Event`) are valid as value_type.
   """
 
   alias Vaisto.Error
@@ -13,7 +16,7 @@ defmodule VaistoBpf.MapDef do
 
   @type t :: %__MODULE__{
           name: atom(),
-          map_type: :hash | :array,
+          map_type: :hash | :array | :ringbuf,
           key_type: atom(),
           value_type: atom(),
           max_entries: pos_integer(),
