@@ -4,23 +4,23 @@ defmodule VaistoBpf.ContextPointerTest do
   alias VaistoBpf.Preprocessor
   alias VaistoBpf.BpfTypeChecker
 
-  defp type_check(source, opts \\ []) do
-    {cleaned, _section, prog_type} = Preprocessor.extract_program(source)
+  defp type_check(source) do
+    {cleaned, _section, _prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
-    BpfTypeChecker.check(normalized, maps, Keyword.merge([program_type: prog_type], opts))
+    BpfTypeChecker.check(normalized, maps)
   end
 
   defp compile_ir(source) do
-    {cleaned, _section, prog_type} = Preprocessor.extract_program(source)
+    {cleaned, _section, _prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
-    {:ok, _, typed_ast} = BpfTypeChecker.check(normalized, maps, program_type: prog_type)
+    {:ok, _, typed_ast} = BpfTypeChecker.check(normalized, maps)
     {:ok, ast} = VaistoBpf.Validator.validate(typed_ast)
     VaistoBpf.Emitter.emit(ast, maps)
   end

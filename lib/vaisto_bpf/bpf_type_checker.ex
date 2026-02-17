@@ -36,14 +36,13 @@ defmodule VaistoBpf.BpfTypeChecker do
   Accepts an optional list of `%MapDef{}` structs. Map names are injected
   into the environment as `:u64` values (map FDs are u64 at the BPF level).
 
-  Options:
-    - `:program_type` — atom like `:xdp`, `:kprobe`, etc. Used to inject
-      built-in context struct definitions.
+  Built-in context types (XdpMd, SkBuff, PtRegs) are injected unconditionally
+  so programs can use them without explicit `deftype`. User `deftype` overrides.
 
   Returns `{:ok, type, typed_ast}` or `{:error, %Vaisto.Error{}}`.
   """
-  @spec check(term(), [VaistoBpf.MapDef.t()], keyword()) :: {:ok, term(), term()} | {:error, Error.t()}
-  def check(ast, maps \\ [], opts \\ []) do
+  @spec check(term(), [VaistoBpf.MapDef.t()]) :: {:ok, term(), term()} | {:error, Error.t()}
+  def check(ast, maps \\ []) do
     env = Enum.reduce(maps, %{}, fn md, env ->
       Map.put(env, md.name, :u64)
     end)
@@ -52,7 +51,6 @@ defmodule VaistoBpf.BpfTypeChecker do
     # Store map definitions for type refinement (e.g., map_lookup_elem returns {:ptr, RecordName})
     map_defs_lookup = Map.new(maps, fn md -> {md.name, md} end)
     env = Map.put(env, :__map_defs__, map_defs_lookup)
-    env = Map.put(env, :__program_type__, Keyword.get(opts, :program_type))
     check_toplevel(ast, env)
   end
 
