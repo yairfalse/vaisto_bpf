@@ -54,7 +54,7 @@ defmodule VaistoBpf.Emitter do
       instructions: [],
       maps: map_lookup,
       stack_offset: 0,
-      record_defs: %{},
+      record_defs: Map.new(VaistoBpf.ContextTypes.all()),
       user_fns: MapSet.new()
     }
   end

@@ -49,17 +49,18 @@ defmodule VaistoBpf.Preprocessor do
   @doc """
   Extract `(program ...)` annotation from source text.
 
-  Returns `{cleaned_source, section_name | nil}` where section_name is
-  the ELF section name derived from the program type and optional attach point.
+  Returns `{cleaned_source, section_name | nil, program_type_atom | nil}` where
+  section_name is the ELF section name derived from the program type and optional
+  attach point, and program_type_atom is the program type as an atom (e.g. `:xdp`).
   """
-  @spec extract_program(String.t()) :: {String.t(), String.t() | nil}
+  @spec extract_program(String.t()) :: {String.t(), String.t() | nil, atom() | nil}
   def extract_program(source) do
     case Regex.run(@program_pattern, source) do
       [full, prog_type, attach_point] ->
         if prog_type in @supported_program_types do
           replacement = String.duplicate(" ", String.length(full))
           cleaned = String.replace(source, full, replacement, global: false)
-          {cleaned, build_section_name(prog_type, attach_point)}
+          {cleaned, build_section_name(prog_type, attach_point), String.to_atom(prog_type)}
         else
           raise "unsupported program type: #{prog_type}"
         end
@@ -68,13 +69,13 @@ defmodule VaistoBpf.Preprocessor do
         if prog_type in @supported_program_types do
           replacement = String.duplicate(" ", String.length(full))
           cleaned = String.replace(source, full, replacement, global: false)
-          {cleaned, build_section_name(prog_type, nil)}
+          {cleaned, build_section_name(prog_type, nil), String.to_atom(prog_type)}
         else
           raise "unsupported program type: #{prog_type}"
         end
 
       nil ->
-        {source, nil}
+        {source, nil, nil}
     end
   end
 

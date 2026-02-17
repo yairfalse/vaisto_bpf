@@ -5,35 +5,40 @@ defmodule VaistoBpf.ProgramTypeTest do
 
   describe "extract_program/1" do
     test "returns nil when no annotation present" do
-      {cleaned, section} = Preprocessor.extract_program("(defn foo [] :u64 0)")
+      {cleaned, section, prog_type} = Preprocessor.extract_program("(defn foo [] :u64 0)")
       assert section == nil
+      assert prog_type == nil
       assert cleaned == "(defn foo [] :u64 0)"
     end
 
     test "extracts kprobe with function name" do
       source = ~s|(program :kprobe "do_sys_open")\n(defn handler [] :u64 0)|
-      {cleaned, section} = Preprocessor.extract_program(source)
+      {cleaned, section, prog_type} = Preprocessor.extract_program(source)
       assert section == "kprobe/do_sys_open"
+      assert prog_type == :kprobe
       refute String.contains?(cleaned, "program")
     end
 
     test "extracts xdp without attach point" do
       source = "(program :xdp)\n(defn handler [] :u64 0)"
-      {cleaned, section} = Preprocessor.extract_program(source)
+      {cleaned, section, prog_type} = Preprocessor.extract_program(source)
       assert section == "xdp"
+      assert prog_type == :xdp
       refute String.contains?(cleaned, "program")
     end
 
     test "extracts tracepoint with nested path" do
       source = ~s|(program :tracepoint "syscalls/sys_enter_open")|
-      {_cleaned, section} = Preprocessor.extract_program(source)
+      {_cleaned, section, prog_type} = Preprocessor.extract_program(source)
       assert section == "tracepoint/syscalls/sys_enter_open"
+      assert prog_type == :tracepoint
     end
 
     test "preserves surrounding source code" do
       source = "(defn before [] :u64 1)\n(program :xdp)\n(defn after [] :u64 2)"
-      {cleaned, section} = Preprocessor.extract_program(source)
+      {cleaned, section, prog_type} = Preprocessor.extract_program(source)
       assert section == "xdp"
+      assert prog_type == :xdp
       assert String.contains?(cleaned, "before")
       assert String.contains?(cleaned, "after")
     end
@@ -47,8 +52,9 @@ defmodule VaistoBpf.ProgramTypeTest do
     test "extracts all supported types" do
       for type <- ~w(kprobe kretprobe uprobe uretprobe xdp tc
                      tracepoint raw_tracepoint socket_filter cgroup_skb) do
-        {_cleaned, section} = Preprocessor.extract_program("(program :#{type})")
+        {_cleaned, section, prog_type} = Preprocessor.extract_program("(program :#{type})")
         assert section == type
+        assert prog_type == String.to_atom(type)
       end
     end
   end
