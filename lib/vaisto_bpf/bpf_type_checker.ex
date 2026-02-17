@@ -44,6 +44,9 @@ defmodule VaistoBpf.BpfTypeChecker do
       Map.put(env, md.name, :u64)
     end)
     env = inject_memory_builtins(env)
+    # Store map definitions for type refinement (e.g., map_lookup_elem returns {:ptr, RecordName})
+    map_defs_lookup = Map.new(maps, fn md -> {md.name, md} end)
+    env = Map.put(env, :__map_defs__, map_defs_lookup)
     check_toplevel(ast, env)
   end
 
@@ -116,6 +119,12 @@ defmodule VaistoBpf.BpfTypeChecker do
           |> Map.put(name, fn_type)
           |> Map.put({:qualified, mod, name}, fn_type)
     collect_signatures(rest, env)
+  end
+
+  # deftype (product): collect record type into env for field access resolution
+  defp collect_signatures([{:deftype, name, {:product, fields}, _loc} | rest], env) do
+    record_type = {:record, name, fields}
+    collect_signatures(rest, Map.put(env, name, record_type))
   end
 
   defp collect_signatures([_ | rest], env) do
@@ -314,7 +323,10 @@ defmodule VaistoBpf.BpfTypeChecker do
         else
           case check_call_args(qname, args, param_types, ret_type, env) do
             {:ok, ret_type, {:call, _qname, typed_args, ret_type}} ->
-              {:ok, ret_type, {:call, {:qualified, mod, name}, typed_args, ret_type}}
+              # Refine return type for map_lookup_elem: if first arg is a known map
+              # with a record value_type, return {:ptr, RecordName} instead of {:ptr, :u64}
+              refined_ret = maybe_refine_map_lookup_ret(name, args, ret_type, env)
+              {:ok, refined_ret, {:call, {:qualified, mod, name}, typed_args, refined_ret}}
             err -> err
           end
         end
@@ -392,9 +404,58 @@ defmodule VaistoBpf.BpfTypeChecker do
     check_match(scrutinee, clauses, env, expected)
   end
 
+  # for-range loop: (for-range i start end body) → :unit
+  defp check_expr({:for_range, var, start_expr, end_expr, body, _loc}, env, _expected)
+       when is_atom(var) do
+    # Pre-check: determine type context from whichever side has a known type
+    start_pre = pre_check_type(start_expr, env)
+    end_pre = pre_check_type(end_expr, env)
+    context = start_pre || end_pre || :u64
+
+    with {:ok, start_type, typed_start} <- check_expr(start_expr, env, context),
+         {:ok, end_type, typed_end} <- check_expr(end_expr, env, start_type) do
+      cond do
+        start_type not in @bpf_int_types ->
+          {:error, Error.new("for-range start must be an integer type, got #{format_type(start_type)}")}
+
+        end_type not in @bpf_int_types ->
+          {:error, Error.new("for-range end must be an integer type, got #{format_type(end_type)}")}
+
+        start_type != end_type ->
+          {:error, Error.new("for-range start and end must be the same type",
+            expected: start_type, actual: end_type)}
+
+        true ->
+          body_env = Map.put(env, var, start_type)
+          case check_expr(body, body_env, nil) do
+            {:ok, _body_type, typed_body} ->
+              {:ok, :unit, {:for_range, var, typed_start, typed_end, typed_body, start_type}}
+
+            err -> err
+          end
+      end
+    end
+  end
+
   # do block (sequential expressions)
   defp check_expr({:do, exprs, _loc}, env, expected) do
     check_do(exprs, env, expected)
+  end
+
+  # Field access: (. expr :field) — resolve record type and find field
+  defp check_expr({:field_access, expr, field, _loc}, env, _expected) do
+    case check_expr(expr, env, nil) do
+      {:ok, {:ptr, record_name}, typed_expr} when is_atom(record_name) ->
+        resolve_field_access(record_name, field, typed_expr, env)
+
+      {:ok, {:record, record_name, _fields} = _rec_type, typed_expr} ->
+        resolve_field_access(record_name, field, typed_expr, env)
+
+      {:ok, other_type, _typed_expr} ->
+        {:error, Error.new("field access requires a record or pointer-to-record type, got #{format_type(other_type)}")}
+
+      err -> err
+    end
   end
 
   # Rejected constructs
@@ -606,7 +667,7 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp check_arg_list([{arg, expected_type} | rest], env, acc) do
     case check_expr(arg, env, expected_type) do
       {:ok, actual_type, typed_arg} ->
-        if types_compatible?(expected_type, actual_type) do
+        if arg_compatible?(expected_type, actual_type) do
           check_arg_list(rest, env, [typed_arg | acc])
         else
           {:error, Error.new("argument type mismatch",
@@ -640,9 +701,9 @@ defmodule VaistoBpf.BpfTypeChecker do
     {env, {:var, :_, type}}
   end
 
-  # (Some var) on {:ptr, T} — bind var to inner type T (non-null path)
-  defp bind_pattern({:call, :Some, [var], _loc}, {:ptr, inner_type}, env) when is_atom(var) do
-    {Map.put(env, var, inner_type), {:some_pattern, {:var, var, inner_type}}}
+  # (Some var) on {:ptr, T} — bind var to {:ptr, T} (the non-null pointer itself)
+  defp bind_pattern({:call, :Some, [var], _loc}, {:ptr, _inner} = ptr_type, env) when is_atom(var) do
+    {Map.put(env, var, ptr_type), {:some_pattern, {:var, var, ptr_type}}}
   end
 
   # (None) on {:ptr, _} — null path, no binding
@@ -670,6 +731,13 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp types_compatible?({:ptr, a}, {:ptr, a}), do: true
   defp types_compatible?(_, _), do: false
 
+  # Pointers are u64 at the BPF level — allow passing to helpers expecting :u64
+  defp arg_compatible?(expected, actual) do
+    types_compatible?(expected, actual) or
+      (expected == :u64 and match?({:ptr, _}, actual)) or
+      (match?({:ptr, _}, expected) and actual == :u64)
+  end
+
   defp pick_concrete(a, _b), do: a
 
   defp is_bool_type?({:ok, :bool, _}, _), do: true
@@ -695,6 +763,16 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   defp validate_bpf_type({:ptr, inner}), do: validate_bpf_type(inner)
+  defp validate_bpf_type(:none), do: :ok
+
+  # Record names (capitalized atoms) are valid BPF types when defined
+  defp validate_bpf_type(name) when is_atom(name) do
+    if Atom.to_string(name) =~ ~r/^[A-Z]/ do
+      :ok
+    else
+      {:error, Error.new("unsupported type in BPF module: #{inspect(name)}")}
+    end
+  end
 
   defp validate_bpf_type({:record, _name, fields}), do: validate_fields(fields)
 
@@ -738,6 +816,51 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   defp unwrap_type({:atom, t}), do: t
   defp unwrap_type(t), do: t
+
+  # Refine map_lookup_elem return type based on map's value_type
+  defp maybe_refine_map_lookup_ret(:map_lookup_elem, [first_arg | _], {:ptr, _}, env) do
+    map_name = extract_map_name(first_arg)
+    map_defs = Map.get(env, :__map_defs__, %{})
+
+    case {map_name, map_defs} do
+      {name, defs} when is_atom(name) and is_map(defs) ->
+        case Map.fetch(defs, name) do
+          {:ok, md} ->
+            vt = md.value_type
+            # If value_type is a record name (capitalized), use {:ptr, RecordName}
+            if is_atom(vt) and Atom.to_string(vt) =~ ~r/^[A-Z]/ do
+              {:ptr, vt}
+            else
+              {:ptr, vt}
+            end
+          :error -> {:ptr, :u64}
+        end
+      _ -> {:ptr, :u64}
+    end
+  end
+
+  defp maybe_refine_map_lookup_ret(_name, _args, ret_type, _env), do: ret_type
+
+  defp extract_map_name(name) when is_atom(name), do: name
+  defp extract_map_name(_), do: nil
+
+  # Resolve field access on a record type
+  defp resolve_field_access(record_name, field, typed_expr, env) do
+    case Map.fetch(env, record_name) do
+      {:ok, {:record, _name, fields}} ->
+        case List.keyfind(fields, field, 0) do
+          {^field, field_type} ->
+            {:ok, field_type,
+             {:field_access, typed_expr, field, field_type, record_name}}
+
+          nil ->
+            {:error, Error.new("record `#{record_name}` has no field `#{field}`")}
+        end
+
+      _ ->
+        {:error, Error.new("unknown record type `#{record_name}`")}
+    end
+  end
 
   defp format_type(type) when is_atom(type), do: ":#{type}"
   defp format_type({:fn, args, ret}) do

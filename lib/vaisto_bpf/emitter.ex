@@ -53,7 +53,9 @@ defmodule VaistoBpf.Emitter do
       vars: %{},
       instructions: [],
       maps: map_lookup,
-      stack_offset: 0
+      stack_offset: 0,
+      record_defs: %{},
+      user_fns: MapSet.new()
     }
   end
 
@@ -105,6 +107,15 @@ defmodule VaistoBpf.Emitter do
   # ============================================================================
 
   defp emit_node({:module, forms}, ctx) do
+    # Collect record definitions and user function names
+    ctx = Enum.reduce(forms, ctx, fn
+      {:deftype, name, {:product, fields}, _type}, ctx ->
+        %{ctx | record_defs: Map.put(ctx.record_defs, name, fields)}
+      {:defn, name, _params, _body, _fn_type}, ctx ->
+        %{ctx | user_fns: MapSet.put(ctx.user_fns, name)}
+      _, ctx -> ctx
+    end)
+
     Enum.reduce(forms, {Types.r0(), ctx}, fn form, {_reg, ctx} ->
       emit_node(form, ctx)
     end)
@@ -326,14 +337,27 @@ defmodule VaistoBpf.Emitter do
     end
   end
 
-  # Generic call (catch-all for builtins we don't special-case)
+  # User function call (BPF-to-BPF)
+  defp emit_node({:call, name, args, _ret_type}, ctx)
+       when is_atom(name) and is_list(args) do
+    if MapSet.member?(ctx.user_fns, name) do
+      emit_bpf_to_bpf_call(name, args, ctx)
+    else
+      # Generic call catch-all: emit all args, return the last one
+      {last_reg, ctx} =
+        Enum.reduce(args, {Types.r0(), ctx}, fn arg, {_reg, ctx} ->
+          emit_node(arg, ctx)
+        end)
+      {last_reg, ctx}
+    end
+  end
+
+  # Generic call (non-atom op, e.g. tuples)
   defp emit_node({:call, _op, args, _ret_type}, ctx) do
-    # Emit all args, return the last one (placeholder for unknown ops)
     {last_reg, ctx} =
       Enum.reduce(args, {Types.r0(), ctx}, fn arg, {_reg, ctx} ->
         emit_node(arg, ctx)
       end)
-
     {last_reg, ctx}
   end
 
@@ -422,12 +446,75 @@ defmodule VaistoBpf.Emitter do
     end)
   end
 
-  # Field access — placeholder (would need layout info for real offset calculation)
-  defp emit_node({:field_access, expr, _field, _type}, ctx) do
-    emit_node(expr, ctx)
+  # for-range loop: bounded loop with JGE/JA
+  defp emit_node({:for_range, var, start_expr, end_expr, body, _iter_type}, ctx) do
+    # Emit start and end values
+    {start_reg, ctx} = emit_node(start_expr, ctx)
+    {end_reg, ctx} = emit_node(end_expr, ctx)
+
+    # Allocate iterator register, copy start value
+    {iter_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:mov_reg, iter_reg, start_reg})
+    ctx = maybe_free_reg(ctx, start_reg)
+
+    # Bind loop variable to iterator register
+    ctx = bind_var(ctx, var, iter_reg)
+
+    # Labels for loop structure
+    {loop_label, ctx} = alloc_label(ctx)
+    {done_label, ctx} = alloc_label(ctx)
+
+    # loop:
+    ctx = push(ctx, {:label, loop_label})
+    # if iter >= end, goto done
+    ctx = push(ctx, {:jmp_reg, :jge, iter_reg, end_reg, done_label})
+
+    # body (result discarded)
+    {body_reg, ctx} = emit_node(body, ctx)
+    ctx = maybe_free_reg(ctx, body_reg)
+
+    # iter += 1
+    ctx = push(ctx, {:alu64_imm, :add, iter_reg, 1})
+    # goto loop (backward jump)
+    ctx = push(ctx, {:ja, loop_label})
+
+    # done:
+    ctx = push(ctx, {:label, done_label})
+
+    # Free loop-local registers
+    ctx = maybe_free_reg(ctx, iter_reg)
+    ctx = maybe_free_reg(ctx, end_reg)
+
+    # Result is :unit (0)
+    {result_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:mov_imm, result_reg, 0})
+    {result_reg, ctx}
   end
 
-  defp emit_node({:field_access, expr, _field, _record_type, _type}, ctx) do
+  # Field access on record: emit LDX_MEM at computed offset
+  defp emit_node({:field_access, expr, field, field_type, record_name}, ctx) do
+    {ptr_reg, ctx} = emit_node(expr, ctx)
+
+    # Look up record fields and compute offset
+    fields = Map.fetch!(ctx.record_defs, record_name)
+    layout = VaistoBpf.Layout.calculate_layout(fields)
+    field_layout = Enum.find(layout.fields, fn fl -> fl.name == field end)
+
+    unless field_layout do
+      raise "unknown field #{field} on record #{record_name}"
+    end
+
+    offset = field_layout.offset
+    size = type_to_mem_size(field_type)
+
+    ctx = maybe_free_reg(ctx, ptr_reg)
+    {dst, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:ldx_mem, size, dst, ptr_reg, offset})
+    {dst, ctx}
+  end
+
+  # Legacy 4-element field_access (pass-through for non-record types)
+  defp emit_node({:field_access, expr, _field, _type}, ctx) do
     emit_node(expr, ctx)
   end
 
@@ -575,6 +662,42 @@ defmodule VaistoBpf.Emitter do
   end
 
   # ============================================================================
+  # BPF-to-BPF Function Calls
+  # ============================================================================
+
+  defp emit_bpf_to_bpf_call(name, args, ctx) do
+    # 1. Evaluate all args into temporary registers
+    {arg_regs, ctx} =
+      Enum.map_reduce(args, ctx, fn arg, ctx ->
+        emit_node(arg, ctx)
+      end)
+
+    # 2. Spill caller-saved registers (r1-r5)
+    {ctx, restore_map} = spill_caller_saved(ctx)
+
+    # 3. Remap arg_regs through restore_map
+    arg_regs = Enum.map(arg_regs, fn reg -> Map.get(restore_map, reg, reg) end)
+
+    # 4. Free arg temp registers
+    ctx = Enum.reduce(arg_regs, ctx, fn reg, ctx -> maybe_free_reg(ctx, reg) end)
+
+    # 5. Place args in r1-r5 (no ptr_args for user functions)
+    ctx = place_args(arg_regs, [], ctx)
+
+    # 6. Emit BPF-to-BPF call (label-based, resolved by assembler)
+    ctx = push(ctx, {:call_fn, {:fn, name}})
+
+    # 7. Reclaim r1-r5
+    ctx = reclaim_registers(ctx)
+
+    # 8. Copy result from r0
+    {result_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:mov_reg, result_reg, Types.r0()})
+
+    {result_reg, ctx}
+  end
+
+  # ============================================================================
   # Helper Call Register Spilling
   # ============================================================================
 
@@ -658,4 +781,11 @@ defmodule VaistoBpf.Emitter do
   defp is_64bit?(type) when type in [:u64, :i64], do: true
   defp is_64bit?({:fn, _, ret}), do: is_64bit?(ret)
   defp is_64bit?(_), do: false
+
+  # Map BPF type to memory access size atom
+  defp type_to_mem_size(type) when type in [:u8, :i8], do: :u8
+  defp type_to_mem_size(type) when type in [:u16, :i16], do: :u16
+  defp type_to_mem_size(type) when type in [:u32, :i32], do: :u32
+  defp type_to_mem_size(type) when type in [:u64, :i64], do: :u64
+  defp type_to_mem_size(_), do: :u64
 end

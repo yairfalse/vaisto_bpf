@@ -31,6 +31,7 @@ defmodule VaistoBpf.Layout do
   Size of a BPF type in bytes.
   """
   @spec sizeof(Types.bpf_type() | {:record, atom(), [{atom(), term()}]}) :: non_neg_integer()
+  def sizeof(:none), do: 0
   def sizeof(:u8), do: 1
   def sizeof(:i8), do: 1
   def sizeof(:bool), do: 1

@@ -186,6 +186,15 @@ defmodule VaistoBpf.Validator do
     end
   end
 
+  # for-range loops
+  defp do_validate({:for_range, _var, start, end_expr, body, _iter_type}, ctx) do
+    with :ok <- do_validate(start, ctx),
+         :ok <- do_validate(end_expr, ctx),
+         :ok <- do_validate(body, ctx) do
+      :ok
+    end
+  end
+
   # do blocks (sequential expressions)
   defp do_validate({:do, exprs, _type}, ctx) do
     validate_list(exprs, ctx)

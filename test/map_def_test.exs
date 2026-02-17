@@ -21,7 +21,7 @@ defmodule VaistoBpf.MapDefTest do
     end
 
     test "rejects unsupported map type" do
-      assert {:error, err} = MapDef.new(:m, :ringbuf, :u32, :u64, 100)
+      assert {:error, err} = MapDef.new(:m, :lpm_trie, :u32, :u64, 100)
       assert err.message =~ "unsupported map type"
     end
 

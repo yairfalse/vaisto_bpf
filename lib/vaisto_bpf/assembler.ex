@@ -149,6 +149,12 @@ defmodule VaistoBpf.Assembler do
     Types.encode(Types.call_helper(helper_id))
   end
 
+  defp emit_instruction({:call_fn, label}, idx, labels) do
+    target = Map.fetch!(labels, label)
+    offset = target - (idx + 1)
+    Types.encode(Types.call_bpf_fn(offset))
+  end
+
   defp emit_instruction({:ldx_mem, size, dst, src, offset}, _idx, _labels) do
     Types.encode(Types.ldx_mem(size_to_mem_mode(size), dst, src, offset))
   end

@@ -292,6 +292,11 @@ defmodule VaistoBpf.Types do
     %__MODULE__{opcode: @bpf_call ||| @bpf_jmp, dst: 0, src: 0, offset: 0, imm: helper_id}
   end
 
+  @doc "BPF-to-BPF function call (BPF_PSEUDO_CALL, src_reg=1)"
+  def call_bpf_fn(relative_offset) do
+    %__MODULE__{opcode: @bpf_call ||| @bpf_jmp, dst: 0, src: 1, offset: 0, imm: relative_offset}
+  end
+
   @doc """
   LD_IMM64 with pseudo-map-FD (src_reg=1).
 
