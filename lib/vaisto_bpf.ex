@@ -65,7 +65,7 @@ defmodule VaistoBpf do
   """
   @spec compile_source(String.t()) :: {:ok, [binary()]} | {:error, Vaisto.Error.t()}
   def compile_source(source) do
-    {cleaned, _section} = Preprocessor.extract_program(source)
+    {cleaned, _section, _prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
@@ -90,7 +90,7 @@ defmodule VaistoBpf do
   """
   @spec compile_source_to_elf(String.t(), keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
   def compile_source_to_elf(source, opts \\ []) do
-    {cleaned, section_name} = Preprocessor.extract_program(source)
+    {cleaned, section_name, _prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)

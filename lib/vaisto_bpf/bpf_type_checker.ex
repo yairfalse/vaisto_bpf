@@ -36,6 +36,9 @@ defmodule VaistoBpf.BpfTypeChecker do
   Accepts an optional list of `%MapDef{}` structs. Map names are injected
   into the environment as `:u64` values (map FDs are u64 at the BPF level).
 
+  Built-in context types (XdpMd, SkBuff, PtRegs) are injected unconditionally
+  so programs can use them without explicit `deftype`. User `deftype` overrides.
+
   Returns `{:ok, type, typed_ast}` or `{:error, %Vaisto.Error{}}`.
   """
   @spec check(term(), [VaistoBpf.MapDef.t()]) :: {:ok, term(), term()} | {:error, Error.t()}
@@ -44,6 +47,7 @@ defmodule VaistoBpf.BpfTypeChecker do
       Map.put(env, md.name, :u64)
     end)
     env = inject_memory_builtins(env)
+    env = inject_builtin_context_types(env)
     # Store map definitions for type refinement (e.g., map_lookup_elem returns {:ptr, RecordName})
     map_defs_lookup = Map.new(maps, fn md -> {md.name, md} end)
     env = Map.put(env, :__map_defs__, map_defs_lookup)
@@ -69,6 +73,26 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp inject_memory_builtins(env) do
     Enum.reduce(@memory_builtins, env, fn {name, fn_type}, env ->
       Map.put(env, {:qualified, :bpf, name}, fn_type)
+    end)
+  end
+
+  # Inject built-in BPF context types (XdpMd, SkBuff, PtRegs) as records.
+  # Runs BEFORE collect_signatures, so user `deftype` with the same name overrides.
+  defp inject_builtin_context_types(env) do
+    Enum.reduce(VaistoBpf.ContextTypes.all(), env, fn {name, fields}, env ->
+      Map.put(env, name, {:record, name, fields})
+    end)
+  end
+
+  # Auto-promote record-typed params to {:ptr, RecordName}.
+  # In BPF, context structs are always accessed through pointers.
+  defp promote_record_params(params, env) do
+    Enum.map(params, fn {name, type} ->
+      if is_atom(type) and match?({:ok, {:record, _, _}}, Map.fetch(env, type)) do
+        {name, {:ptr, type}}
+      else
+        {name, type}
+      end
     end)
   end
 
@@ -102,7 +126,8 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp collect_signatures([], env), do: {env, []}
 
   defp collect_signatures([{:defn, name, params, _body, ret_type, _loc} | rest], env) do
-    param_types = Enum.map(params, fn {_name, type} -> type end)
+    promoted = promote_record_params(params, env)
+    param_types = Enum.map(promoted, fn {_name, type} -> type end)
     fn_type = {:fn, param_types, ret_type}
     collect_signatures(rest, Map.put(env, name, fn_type))
   end
@@ -205,6 +230,8 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp check_form({:defn, name, params, body, ret_type, _loc}, env) do
     with :ok <- validate_bpf_type(ret_type),
          :ok <- validate_param_types(params) do
+      # Promote record-typed params to {:ptr, RecordName} after validation
+      params = promote_record_params(params, env)
       param_types = Enum.map(params, fn {_n, t} -> t end)
       fn_type = {:fn, param_types, ret_type}
 
