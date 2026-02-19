@@ -310,6 +310,24 @@ defmodule VaistoBpf.Types do
     {insn1, insn2}
   end
 
+  # ============================================================================
+  # Endian (Byte-Swap) Instructions
+  # ============================================================================
+
+  @bpf_end 0xD0
+  @bpf_to_le 0x00
+  @bpf_to_be 0x08
+
+  @doc "Byte-swap to big-endian: dst = htobe(dst, width)"
+  def endian_be(dst, width) do
+    %__MODULE__{opcode: @bpf_end ||| @bpf_to_be ||| @bpf_alu, dst: dst, src: 0, offset: 0, imm: width}
+  end
+
+  @doc "Byte-swap to little-endian: dst = htole(dst, width)"
+  def endian_le(dst, width) do
+    %__MODULE__{opcode: @bpf_end ||| @bpf_to_le ||| @bpf_alu, dst: dst, src: 0, offset: 0, imm: width}
+  end
+
   @doc "Store from register to memory: *(size *)(dst + offset) = src"
   def stx_mem(size, dst, src, offset) do
     %__MODULE__{opcode: size ||| @bpf_mem ||| @bpf_stx, dst: dst, src: src, offset: offset, imm: 0}

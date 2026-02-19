@@ -1,0 +1,20 @@
+services:
+  test:
+    build: .
+    volumes:
+      - .:/app/vaisto_bpf
+      - ../vaisto:/app/vaisto
+    working_dir: /app/vaisto_bpf
+    privileged: true
+    command: sh -c "mix deps.get && mix test --include linux"
+
+  shell:
+    build: .
+    volumes:
+      - .:/app/vaisto_bpf
+      - ../vaisto:/app/vaisto
+    working_dir: /app/vaisto_bpf
+    privileged: true
+    stdin_open: true
+    tty: true
+    command: bash

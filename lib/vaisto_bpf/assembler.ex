@@ -163,6 +163,14 @@ defmodule VaistoBpf.Assembler do
     Types.encode(Types.stx_mem(size_to_mem_mode(size), dst, src, offset))
   end
 
+  defp emit_instruction({:endian, :be, width, dst}, _idx, _labels) do
+    Types.encode(Types.endian_be(dst, width))
+  end
+
+  defp emit_instruction({:endian, :le, width, dst}, _idx, _labels) do
+    Types.encode(Types.endian_le(dst, width))
+  end
+
   defp emit_instruction(:exit, _idx, _labels) do
     Types.encode(Types.exit_insn())
   end

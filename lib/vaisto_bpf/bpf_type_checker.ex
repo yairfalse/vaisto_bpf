@@ -70,8 +70,20 @@ defmodule VaistoBpf.BpfTypeChecker do
     {:stack_load_u32,  {:fn, [:u64], :u32}},
   ]
 
+  @endian_builtins [
+    {:be16, {:fn, [:u16], :u16}},
+    {:be32, {:fn, [:u32], :u32}},
+    {:be64, {:fn, [:u64], :u64}},
+    {:le16, {:fn, [:u16], :u16}},
+    {:le32, {:fn, [:u32], :u32}},
+    {:le64, {:fn, [:u64], :u64}},
+  ]
+
   defp inject_memory_builtins(env) do
-    Enum.reduce(@memory_builtins, env, fn {name, fn_type}, env ->
+    env = Enum.reduce(@memory_builtins, env, fn {name, fn_type}, env ->
+      Map.put(env, {:qualified, :bpf, name}, fn_type)
+    end)
+    Enum.reduce(@endian_builtins, env, fn {name, fn_type}, env ->
       Map.put(env, {:qualified, :bpf, name}, fn_type)
     end)
   end
@@ -368,28 +380,30 @@ defmodule VaistoBpf.BpfTypeChecker do
     end
   end
 
+  # Type cast: (u64 expr), (u32 expr), etc. — widening/narrowing between BPF integer types
+  @cast_types MapSet.new(@bpf_int_types)
+
+  defp check_expr({:call, cast_name, [inner], _loc}, env, _expected)
+       when is_atom(cast_name) do
+    if MapSet.member?(@cast_types, cast_name) do
+      case check_expr(inner, env, nil) do
+        {:ok, src_type, typed_inner} when src_type in @bpf_int_types ->
+          {:ok, cast_name, {:cast, cast_name, typed_inner, src_type}}
+
+        {:ok, src_type, _} ->
+          {:error, Error.new("type cast requires an integer type, got #{format_type(src_type)}")}
+
+        err ->
+          err
+      end
+    else
+      check_named_call(cast_name, [inner], env)
+    end
+  end
+
   # Function call (named)
   defp check_expr({:call, name, args, _loc}, env, _expected) when is_atom(name) do
-    case Map.fetch(env, name) do
-      {:ok, {:fn, param_types, ret_type}} ->
-        if length(args) != length(param_types) do
-          {:error, Error.new("function `#{name}` expects #{length(param_types)} arguments, got #{length(args)}")}
-        else
-          check_call_args(name, args, param_types, ret_type, env)
-        end
-
-      {:ok, _} ->
-        {:error, Error.new("`#{name}` is not a function")}
-
-      :error ->
-        # Check if it's a self-call (recursion)
-        {:error, Error.new("unknown function `#{name}`",
-          hint: if(String.first("#{name}") =~ ~r/[a-z]/,
-            do: "recursion is not supported in BPF modules",
-            else: nil
-          )
-        )}
-    end
+    check_named_call(name, args, env)
   end
 
   # if expression
@@ -886,6 +900,28 @@ defmodule VaistoBpf.BpfTypeChecker do
 
       _ ->
         {:error, Error.new("unknown record type `#{record_name}`")}
+    end
+  end
+
+  defp check_named_call(name, args, env) do
+    case Map.fetch(env, name) do
+      {:ok, {:fn, param_types, ret_type}} ->
+        if length(args) != length(param_types) do
+          {:error, Error.new("function `#{name}` expects #{length(param_types)} arguments, got #{length(args)}")}
+        else
+          check_call_args(name, args, param_types, ret_type, env)
+        end
+
+      {:ok, _} ->
+        {:error, Error.new("`#{name}` is not a function")}
+
+      :error ->
+        {:error, Error.new("unknown function `#{name}`",
+          hint: if(String.first("#{name}") =~ ~r/[a-z]/,
+            do: "recursion is not supported in BPF modules",
+            else: nil
+          )
+        )}
     end
   end
 
