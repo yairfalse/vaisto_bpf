@@ -148,8 +148,8 @@ defmodule VaistoBpf.MapIntegrationTest do
       assert idx != nil, "should have .maps section"
 
       maps_data = extract_section_data(elf, idx)
-      # 16 bytes per map (4 u32 fields)
-      assert byte_size(maps_data) == 16
+      # 32 bytes per map (4 pointer fields, 8 bytes each)
+      assert byte_size(maps_data) == 32
     end
 
     test "contains .BTF section with correct magic" do
@@ -301,10 +301,10 @@ defmodule VaistoBpf.MapIntegrationTest do
       """
       {:ok, elf} = VaistoBpf.compile_source_to_elf(source)
 
-      # .maps section: 2 × 16 bytes
+      # .maps section: 2 × 32 bytes
       maps_idx = find_section_by_name(elf, ".maps")
       maps_data = extract_section_data(elf, maps_idx)
-      assert byte_size(maps_data) == 32
+      assert byte_size(maps_data) == 64
 
       # Two map symbols + func + null = 4 symbols
       symtab_idx = find_section_by_name(elf, ".symtab")

@@ -44,12 +44,7 @@ defmodule VaistoBpf.LoaderIntegrationTest do
   end
 
   describe "programs with maps" do
-    @tag :skip
-    @tag :btf_fix_needed
     test "reports map names", %{loader: loader} do
-      # NOTE: Skipped until BTF encoding is compatible with libbpf.
-      # libbpf rejects our .BTF section ("Error loading ELF section .BTF: -22").
-      # The loader itself works — this is a pre-existing BTF format issue.
       {:ok, elf} = VaistoBpf.compile_source_to_elf(@xdp_with_map_source)
       assert {:ok, handle, map_names} = Loader.load_xdp(loader, elf, "lo")
       assert "counters" in map_names
