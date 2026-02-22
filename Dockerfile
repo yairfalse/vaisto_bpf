@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     libelf-dev \
     zlib1g-dev \
     iproute2 \
+    iputils-ping \
     git \
     && rm -rf /var/lib/apt/lists/*
 

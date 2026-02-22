@@ -125,15 +125,16 @@ defmodule VaistoBpf.BTF do
         {<<bin::binary, int_bin::binary>>, stab, Map.put(map, type, nid), nid + 1}
       end)
 
-    # For each map, emit ARRAY + PTR + ARRAY + PTR + PTR + PTR + STRUCT + VAR
-    # Each member is a pointer (8 bytes), 4 fields = 32 bytes
+    # For each map, emit ARRAY + PTR types + STRUCT + VAR.
+    # Hash/array maps: 4 members (type, key, value, max_entries) = 32 bytes.
+    # Ringbuf maps: 2 members (type, max_entries) = 16 bytes — no key/value.
+    # We use the max struct size for DATASEC sizing.
     map_struct_size = 32
 
     {map_bins, str_tab, next_id, var_type_ids} =
       Enum.reduce(map_defs, {<<>>, str_tab, next_id, []}, fn md, {bin, stab, nid, var_ids} ->
         u32_type_id = Map.fetch!(int_type_map, :u32)
-        key_type_id = Map.get(int_type_map, md.key_type, 0)
-        value_type_id = Map.get(int_type_map, md.value_type, 0)
+        has_key_value = md.map_type != :ringbuf
 
         # ARRAY for "type" field: element=u32, nelems=map_type_id
         type_array_id = nid
@@ -151,40 +152,63 @@ defmodule VaistoBpf.BTF do
         max_entries_ptr_id = nid + 3
         max_entries_ptr_bin = encode_ptr_type(max_entries_array_id)
 
-        # PTR → key INT
-        key_ptr_id = nid + 4
-        key_ptr_bin = encode_ptr_type(key_type_id)
-
-        # PTR → value INT
-        value_ptr_id = nid + 5
-        value_ptr_bin = encode_ptr_type(value_type_id)
+        # Shared BTF binary for type + max_entries (always present)
+        base_bin = <<type_array_bin::binary, type_ptr_bin::binary,
+                     max_entries_array_bin::binary, max_entries_ptr_bin::binary>>
+        next_after_base = nid + 4
 
         # STRUCT for the map (members point to PTR types)
         {map_name_off, stab} = add_string(stab, Atom.to_string(md.name))
-
         {type_str_off, stab} = add_string(stab, "type")
-        {key_str_off, stab} = add_string(stab, "key")
-        {value_str_off, stab} = add_string(stab, "value")
         {max_str_off, stab} = add_string(stab, "max_entries")
 
-        struct_id = nid + 6
-        struct_bin = encode_struct_type(map_name_off, map_struct_size, [
-          {type_str_off, type_ptr_id, 0},
-          {key_str_off, key_ptr_id, 64},
-          {value_str_off, value_ptr_id, 128},
-          {max_str_off, max_entries_ptr_id, 192}
-        ])
+        if has_key_value do
+          key_type_id = Map.get(int_type_map, md.key_type, 0)
+          value_type_id = Map.get(int_type_map, md.value_type, 0)
 
-        # VAR for the map variable
-        var_id = nid + 7
-        var_bin = encode_var_type(map_name_off, struct_id)
+          # PTR → key INT
+          key_ptr_id = next_after_base
+          key_ptr_bin = encode_ptr_type(key_type_id)
 
-        combined = <<type_array_bin::binary, type_ptr_bin::binary,
-                     max_entries_array_bin::binary, max_entries_ptr_bin::binary,
-                     key_ptr_bin::binary, value_ptr_bin::binary,
-                     struct_bin::binary, var_bin::binary>>
+          # PTR → value INT
+          value_ptr_id = next_after_base + 1
+          value_ptr_bin = encode_ptr_type(value_type_id)
 
-        {<<bin::binary, combined::binary>>, stab, nid + 8, [{md.index, var_id} | var_ids]}
+          {key_str_off, stab} = add_string(stab, "key")
+          {value_str_off, stab} = add_string(stab, "value")
+
+          struct_id = next_after_base + 2
+          struct_bin = encode_struct_type(map_name_off, map_struct_size, [
+            {type_str_off, type_ptr_id, 0},
+            {key_str_off, key_ptr_id, 64},
+            {value_str_off, value_ptr_id, 128},
+            {max_str_off, max_entries_ptr_id, 192}
+          ])
+
+          var_id = next_after_base + 3
+          var_bin = encode_var_type(map_name_off, struct_id)
+
+          combined = <<base_bin::binary, key_ptr_bin::binary, value_ptr_bin::binary,
+                       struct_bin::binary, var_bin::binary>>
+
+          {<<bin::binary, combined::binary>>, stab, next_after_base + 4, [{md.index, var_id} | var_ids]}
+        else
+          # Ringbuf: only type + max_entries members (16 bytes)
+          ringbuf_struct_size = 16
+
+          struct_id = next_after_base
+          struct_bin = encode_struct_type(map_name_off, ringbuf_struct_size, [
+            {type_str_off, type_ptr_id, 0},
+            {max_str_off, max_entries_ptr_id, 64}
+          ])
+
+          var_id = next_after_base + 1
+          var_bin = encode_var_type(map_name_off, struct_id)
+
+          combined = <<base_bin::binary, struct_bin::binary, var_bin::binary>>
+
+          {<<bin::binary, combined::binary>>, stab, next_after_base + 2, [{md.index, var_id} | var_ids]}
+        end
       end)
 
     {<<int_bins::binary, map_bins::binary>>, str_tab, next_id, Enum.reverse(var_type_ids), map_struct_size}
