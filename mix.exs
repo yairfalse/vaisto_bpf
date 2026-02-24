@@ -28,7 +28,7 @@ defmodule VaistoBpf.MixProject do
   defp deps do
     [
       {:vaisto, path: "../vaisto"},
-      {:elixir_make, "~> 0.8", runtime: false}
+      {:elixir_make, "~> 0.9", runtime: false}
     ]
   end
 end

@@ -34,9 +34,12 @@ defmodule VaistoBpf.Loader.Protocol do
     <<@cmd_detach::8, handle::little-32>>
   end
 
+  @max_map_name_len 255
+
   @spec encode_map_lookup(non_neg_integer(), String.t(), binary()) :: binary()
   def encode_map_lookup(handle, map_name, key)
-      when is_integer(handle) and handle >= 0 and is_binary(map_name) and is_binary(key) do
+      when is_integer(handle) and handle >= 0 and is_binary(map_name) and is_binary(key)
+           and byte_size(map_name) <= @max_map_name_len do
     name_len = byte_size(map_name)
     key_len = byte_size(key)
 
@@ -49,7 +52,8 @@ defmodule VaistoBpf.Loader.Protocol do
           binary()
   def encode_map_update(handle, map_name, key, value, flags \\ 0)
       when is_integer(handle) and handle >= 0 and is_binary(map_name) and is_binary(key) and
-             is_binary(value) and is_integer(flags) and flags >= 0 do
+             is_binary(value) and is_integer(flags) and flags >= 0
+             and byte_size(map_name) <= @max_map_name_len do
     name_len = byte_size(map_name)
     key_len = byte_size(key)
     val_len = byte_size(value)
@@ -63,7 +67,8 @@ defmodule VaistoBpf.Loader.Protocol do
 
   @spec encode_map_delete(non_neg_integer(), String.t(), binary()) :: binary()
   def encode_map_delete(handle, map_name, key)
-      when is_integer(handle) and handle >= 0 and is_binary(map_name) and is_binary(key) do
+      when is_integer(handle) and handle >= 0 and is_binary(map_name) and is_binary(key)
+           and byte_size(map_name) <= @max_map_name_len do
     name_len = byte_size(map_name)
     key_len = byte_size(key)
 
@@ -74,14 +79,16 @@ defmodule VaistoBpf.Loader.Protocol do
 
   @spec encode_subscribe_ringbuf(non_neg_integer(), String.t()) :: binary()
   def encode_subscribe_ringbuf(handle, map_name)
-      when is_integer(handle) and handle >= 0 and is_binary(map_name) do
+      when is_integer(handle) and handle >= 0 and is_binary(map_name)
+           and byte_size(map_name) <= @max_map_name_len do
     name_len = byte_size(map_name)
     <<@cmd_subscribe_ringbuf::8, handle::little-32, name_len::8, map_name::binary>>
   end
 
   @spec encode_unsubscribe_ringbuf(non_neg_integer(), String.t()) :: binary()
   def encode_unsubscribe_ringbuf(handle, map_name)
-      when is_integer(handle) and handle >= 0 and is_binary(map_name) do
+      when is_integer(handle) and handle >= 0 and is_binary(map_name)
+           and byte_size(map_name) <= @max_map_name_len do
     name_len = byte_size(map_name)
     <<@cmd_unsubscribe_ringbuf::8, handle::little-32, name_len::8, map_name::binary>>
   end

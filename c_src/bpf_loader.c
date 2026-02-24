@@ -124,6 +124,7 @@ static int write_frame(const uint8_t *data, uint16_t len) {
 
 static void send_error(const char *msg) {
     size_t mlen = strlen(msg);
+    if (mlen > UINT16_MAX - 1) mlen = UINT16_MAX - 1;
     uint16_t flen = 1 + (uint16_t)mlen;
     uint8_t *buf = malloc(flen);
     if (!buf) return;
@@ -161,15 +162,16 @@ static void handle_load_xdp(const uint8_t *data, uint16_t len) {
     if (len < 5) { send_error("load_xdp: frame too short"); return; }
 
     uint32_t elf_size = read_le32(data);
-    if (len < 4 + elf_size + 1) { send_error("load_xdp: bad elf_size"); return; }
+    if (elf_size > (uint32_t)(len - 5)) { send_error("load_xdp: bad elf_size"); return; }
 
     const uint8_t *elf_data = data + 4;
-    uint8_t iface_len = data[4 + elf_size];
-    if (len < 4 + elf_size + 1 + iface_len) { send_error("load_xdp: bad iface_len"); return; }
+    size_t iface_offset = 4 + (size_t)elf_size;
+    uint8_t iface_len = data[iface_offset];
+    if (iface_len > (uint16_t)(len - iface_offset - 1)) { send_error("load_xdp: bad iface_len"); return; }
 
     char iface[MAX_IFACE + 1];
     if (iface_len > MAX_IFACE) { send_error("load_xdp: interface name too long"); return; }
-    memcpy(iface, data + 4 + elf_size + 1, iface_len);
+    memcpy(iface, data + iface_offset + 1, iface_len);
     iface[iface_len] = '\0';
 
     /* Allocate a slot */
@@ -309,8 +311,8 @@ static int parse_handle_and_map(const uint8_t *data, uint16_t len,
     if (len < 5) return -1;  /* handle(4) + name_len(1) */
     *handle_out = read_le32(data);
     uint8_t name_len = data[4];
-    if (len < 5 + name_len) return -1;
-    if (name_len == 0) return -1;
+    if (name_len == 0 || name_len > 255) return -1;
+    if (len < 5 + (uint16_t)name_len) return -1;
     memcpy(name_out, data + 5, name_len);
     name_out[name_len] = '\0';
     *rest = data + 5 + name_len;
@@ -342,12 +344,13 @@ static void handle_map_lookup(const uint8_t *data, uint16_t len) {
     if (fd < 0) { send_error("map_lookup: bad map fd"); return; }
 
     uint32_t val_size = bpf_map__value_size(map);
+    if (val_size > UINT16_MAX - 5) { send_error("map_lookup: value too large"); return; }
     uint8_t *value_buf = malloc(val_size);
     if (!value_buf) { send_error("map_lookup: alloc failed"); return; }
 
     if (bpf_map_lookup_elem(fd, key, value_buf) == 0) {
         /* Found: [0x00][val_len:4LE][value:N] */
-        uint16_t resp_len = 1 + 4 + val_size;
+        uint16_t resp_len = (uint16_t)(1 + 4 + val_size);
         uint8_t *resp = malloc(resp_len);
         if (!resp) { free(value_buf); send_error("map_lookup: alloc resp failed"); return; }
         resp[0] = RESP_OK;
@@ -461,8 +464,9 @@ static int ringbuf_event_cb(void *ctx, void *data, size_t data_sz) {
     uint8_t name_len = (uint8_t)strlen(sub->map_name);
 
     /* Build: [0x10][handle:4LE][name_len:1][name:N][data_len:4LE][data:N] */
-    uint32_t frame_len = 1 + 4 + 1 + name_len + 4 + (uint32_t)data_sz;
-    if (frame_len > 65535) return 0;  /* too large for {:packet, 2} framing */
+    size_t base_len = 1 + 4 + 1 + (size_t)name_len + 4;
+    if (data_sz > 65535 - base_len) return 0;  /* too large for {:packet, 2} framing */
+    uint32_t frame_len = (uint32_t)(base_len + data_sz);
 
     uint8_t *buf = malloc(frame_len);
     if (!buf) return 0;
