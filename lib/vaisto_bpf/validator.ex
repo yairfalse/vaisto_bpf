@@ -200,6 +200,11 @@ defmodule VaistoBpf.Validator do
     validate_list(exprs, ctx)
   end
 
+  # Type casts
+  defp do_validate({:cast, _target_type, inner, _src_type}, ctx) do
+    do_validate(inner, ctx)
+  end
+
   # Field access on records
   defp do_validate({:field_access, expr, _field, _type}, ctx) do
     do_validate(expr, ctx)

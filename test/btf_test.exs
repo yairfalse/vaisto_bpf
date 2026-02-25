@@ -137,7 +137,7 @@ defmodule VaistoBpf.BTFTest do
       {btf, _maps} = BTF.encode_for_maps([md])
       type_section = extract_type_section(btf)
 
-      vars = find_types_by_kind(type_section, 13)
+      vars = find_types_by_kind(type_section, 14)
       assert length(vars) == 1, "should have one VAR"
     end
 
@@ -220,7 +220,7 @@ defmodule VaistoBpf.BTFTest do
       md = make_map(:counters, :hash, :u32, :u64, 1024, 0)
       {_btf, maps_data} = BTF.encode_for_maps([md])
 
-      assert maps_data == :binary.copy(<<0>>, 16)
+      assert maps_data == :binary.copy(<<0>>, 32)
     end
 
     test "size scales with number of maps" do
@@ -228,7 +228,7 @@ defmodule VaistoBpf.BTFTest do
       md2 = make_map(:data, :array, :u32, :u32, 256, 1)
       {_btf, maps_data} = BTF.encode_for_maps([md1, md2])
 
-      assert byte_size(maps_data) == 32
+      assert byte_size(maps_data) == 64
     end
   end
 
@@ -243,7 +243,7 @@ defmodule VaistoBpf.BTFTest do
       {btf, _maps} = BTF.encode_for_maps([md1, md2])
       type_section = extract_type_section(btf)
 
-      vars = find_types_by_kind(type_section, 13)
+      vars = find_types_by_kind(type_section, 14)
       assert length(vars) == 2
 
       datasecs = find_types_by_kind(type_section, 15)
@@ -295,9 +295,10 @@ defmodule VaistoBpf.BTFTest do
 
   # Extra bytes per BTF kind
   defp type_extra_bytes(1, _vlen), do: 4           # INT: 4-byte encoding
+  defp type_extra_bytes(2, _vlen), do: 0           # PTR: no extra data
   defp type_extra_bytes(3, _vlen), do: 12          # ARRAY: 12-byte info
   defp type_extra_bytes(4, vlen), do: vlen * 12    # STRUCT: 12 bytes per member
-  defp type_extra_bytes(13, _vlen), do: 4          # VAR: 4-byte linkage
+  defp type_extra_bytes(14, _vlen), do: 4          # VAR: 4-byte linkage
   defp type_extra_bytes(15, vlen), do: vlen * 12   # DATASEC: 12 bytes per var
   defp type_extra_bytes(_kind, _vlen), do: 0
 end

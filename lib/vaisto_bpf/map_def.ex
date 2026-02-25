@@ -16,14 +16,14 @@ defmodule VaistoBpf.MapDef do
 
   @type t :: %__MODULE__{
           name: atom(),
-          map_type: :hash | :array | :ringbuf,
+          map_type: :hash | :array | :ringbuf | :prog_array,
           key_type: atom(),
           value_type: atom(),
           max_entries: pos_integer(),
           index: non_neg_integer()
         }
 
-  @map_types %{hash: 1, array: 2, ringbuf: 27}
+  @map_types %{hash: 1, array: 2, prog_array: 3, ringbuf: 27}
 
   @doc """
   Create a new MapDef with validation.
@@ -39,7 +39,7 @@ defmodule VaistoBpf.MapDef do
 
       not Map.has_key?(@map_types, map_type) ->
         {:error, Error.new("unsupported map type :#{map_type}",
-          hint: "supported types: :hash, :array, :ringbuf"
+          hint: "supported types: :hash, :array, :prog_array, :ringbuf"
         )}
 
       map_type != :ringbuf and not valid_bpf_type?(key_type) ->

@@ -13,6 +13,7 @@ defmodule VaistoBpf.Emitter do
   """
 
   alias VaistoBpf.Types
+  import Bitwise
 
   @type context :: %{
           free_regs: [non_neg_integer()],
@@ -258,6 +259,13 @@ defmodule VaistoBpf.Emitter do
     :<= => :jle
   }
 
+  @signed_comparison_ops %{
+    :> => :jsgt,
+    :>= => :jsge,
+    :< => :jslt,
+    :<= => :jsle
+  }
+
   defp emit_node({:call, op, [left, right], ret_type}, ctx) when is_map_key(@alu_ops, op) do
     alu_op = Map.fetch!(@alu_ops, op)
     {left_reg, ctx} = emit_node(left, ctx)
@@ -295,7 +303,13 @@ defmodule VaistoBpf.Emitter do
   # Comparison operations — produce 0 or 1
   defp emit_node({:call, op, [left, right], _ret_type}, ctx)
        when is_map_key(@comparison_ops, op) do
-    jmp_op = Map.fetch!(@comparison_ops, op)
+    jmp_op =
+      if Types.signed?(operand_type(left) || operand_type(right)) do
+        Map.get(@signed_comparison_ops, op, Map.fetch!(@comparison_ops, op))
+      else
+        Map.fetch!(@comparison_ops, op)
+      end
+
     {left_reg, ctx} = emit_node(left, ctx)
     {right_reg, ctx} = emit_node(right, ctx)
     ctx = maybe_free_reg(ctx, left_reg)
@@ -326,13 +340,14 @@ defmodule VaistoBpf.Emitter do
     {dst, ctx}
   end
 
-  # BPF qualified call: memory builtins or helper calls
+  # BPF qualified call: memory builtins, endian builtins, or helper calls
   defp emit_node({:call, {:qualified, :bpf, helper_name}, args, _ret_type}, ctx) do
     case memory_builtin(helper_name) do
       {:load, size} -> emit_load(size, args, ctx)
       {:store, size} -> emit_store(size, args, ctx)
       {:stack_store, size} -> emit_stack_store(size, args, ctx)
       {:stack_load, size} -> emit_stack_load(size, args, ctx)
+      {:endian, {direction, width}} -> emit_endian(direction, width, args, ctx)
       nil -> emit_helper_call(helper_name, args, ctx)
     end
   end
@@ -518,6 +533,27 @@ defmodule VaistoBpf.Emitter do
     emit_node(expr, ctx)
   end
 
+  # Type cast: widening is no-op (BPF regs are 64-bit, LDX_MEM zero-extends).
+  # Narrowing masks to target width.
+  defp emit_node({:cast, target_type, inner, src_type}, ctx) do
+    {reg, ctx} = emit_node(inner, ctx)
+    target_bits = Types.width_bits(target_type)
+    src_bits = Types.width_bits(src_type)
+
+    if target_bits >= src_bits do
+      # Widening or identity: no-op
+      {reg, ctx}
+    else
+      # Narrowing: mask off upper bits
+      ctx = maybe_free_reg(ctx, reg)
+      {dst, ctx} = alloc_reg(ctx)
+      ctx = push(ctx, {:mov_reg, dst, reg})
+      mask = Bitwise.bsl(1, target_bits) - 1
+      ctx = push(ctx, {:alu64_imm, :and, dst, mask})
+      {dst, ctx}
+    end
+  end
+
   # ============================================================================
   # Pattern Matching Helpers
   # ============================================================================
@@ -573,12 +609,18 @@ defmodule VaistoBpf.Emitter do
     stack_load_u64: :u64, stack_load_u32: :u32
   }
 
+  @endian_builtin_map %{
+    be16: {:be, 16}, be32: {:be, 32}, be64: {:be, 64},
+    le16: {:le, 16}, le32: {:le, 32}, le64: {:le, 64}
+  }
+
   defp memory_builtin(name) do
     cond do
       size = Map.get(@memory_load_builtins, name) -> {:load, size}
       size = Map.get(@memory_store_builtins, name) -> {:store, size}
       size = Map.get(@stack_store_builtins, name) -> {:stack_store, size}
       size = Map.get(@stack_load_builtins, name) -> {:stack_load, size}
+      endian = Map.get(@endian_builtin_map, name) -> {:endian, endian}
       true -> nil
     end
   end
@@ -613,6 +655,15 @@ defmodule VaistoBpf.Emitter do
     offset = extract_literal_offset!(offset_expr)
     {dst, ctx} = alloc_reg(ctx)
     ctx = push(ctx, {:ldx_mem, size, dst, Types.r10(), offset})
+    {dst, ctx}
+  end
+
+  defp emit_endian(direction, width, [arg], ctx) do
+    {src_reg, ctx} = emit_node(arg, ctx)
+    ctx = maybe_free_reg(ctx, src_reg)
+    {dst, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:mov_reg, dst, src_reg})
+    ctx = push(ctx, {:endian, direction, width, dst})
     {dst, ctx}
   end
 
@@ -781,6 +832,14 @@ defmodule VaistoBpf.Emitter do
   defp is_64bit?(type) when type in [:u64, :i64], do: true
   defp is_64bit?({:fn, _, ret}), do: is_64bit?(ret)
   defp is_64bit?(_), do: false
+
+  # Extract the BPF type from a typed AST operand (nil if untyped)
+  defp operand_type({:var, _name, type}), do: type
+  defp operand_type({:call, _op, _args, ret_type}), do: ret_type
+  defp operand_type({:cast, target_type, _inner, _src_type}), do: target_type
+  defp operand_type({:field_access, _expr, _field, field_type, _rec}), do: field_type
+  defp operand_type({:lit, :int, _value}), do: nil
+  defp operand_type(_), do: nil
 
   # Map BPF type to memory access size atom
   defp type_to_mem_size(type) when type in [:u8, :i8], do: :u8
