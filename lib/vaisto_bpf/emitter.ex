@@ -259,6 +259,13 @@ defmodule VaistoBpf.Emitter do
     :<= => :jle
   }
 
+  @signed_comparison_ops %{
+    :> => :jsgt,
+    :>= => :jsge,
+    :< => :jslt,
+    :<= => :jsle
+  }
+
   defp emit_node({:call, op, [left, right], ret_type}, ctx) when is_map_key(@alu_ops, op) do
     alu_op = Map.fetch!(@alu_ops, op)
     {left_reg, ctx} = emit_node(left, ctx)
@@ -296,7 +303,13 @@ defmodule VaistoBpf.Emitter do
   # Comparison operations — produce 0 or 1
   defp emit_node({:call, op, [left, right], _ret_type}, ctx)
        when is_map_key(@comparison_ops, op) do
-    jmp_op = Map.fetch!(@comparison_ops, op)
+    jmp_op =
+      if Types.signed?(operand_type(left) || operand_type(right)) do
+        Map.get(@signed_comparison_ops, op, Map.fetch!(@comparison_ops, op))
+      else
+        Map.fetch!(@comparison_ops, op)
+      end
+
     {left_reg, ctx} = emit_node(left, ctx)
     {right_reg, ctx} = emit_node(right, ctx)
     ctx = maybe_free_reg(ctx, left_reg)
@@ -819,6 +832,14 @@ defmodule VaistoBpf.Emitter do
   defp is_64bit?(type) when type in [:u64, :i64], do: true
   defp is_64bit?({:fn, _, ret}), do: is_64bit?(ret)
   defp is_64bit?(_), do: false
+
+  # Extract the BPF type from a typed AST operand (nil if untyped)
+  defp operand_type({:var, _name, type}), do: type
+  defp operand_type({:call, _op, _args, ret_type}), do: ret_type
+  defp operand_type({:cast, target_type, _inner, _src_type}), do: target_type
+  defp operand_type({:field_access, _expr, _field, field_type, _rec}), do: field_type
+  defp operand_type({:lit, :int, _value}), do: nil
+  defp operand_type(_), do: nil
 
   # Map BPF type to memory access size atom
   defp type_to_mem_size(type) when type in [:u8, :i8], do: :u8
