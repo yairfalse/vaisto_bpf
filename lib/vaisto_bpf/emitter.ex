@@ -13,7 +13,6 @@ defmodule VaistoBpf.Emitter do
   """
 
   alias VaistoBpf.Types
-  import Bitwise
 
   @type context :: %{
           free_regs: [non_neg_integer()],
@@ -268,6 +267,10 @@ defmodule VaistoBpf.Emitter do
 
   defp emit_node({:call, op, [left, right], ret_type}, ctx) when is_map_key(@alu_ops, op) do
     alu_op = Map.fetch!(@alu_ops, op)
+
+    # Select signed variants when operands are signed
+    alu_op = maybe_signed_alu_op(alu_op, operand_type(left) || operand_type(right))
+
     {left_reg, ctx} = emit_node(left, ctx)
 
     case right do
@@ -291,12 +294,12 @@ defmodule VaistoBpf.Emitter do
   end
 
   # Negation (unary -)
-  defp emit_node({:call, :-, [operand], _ret_type}, ctx) do
+  defp emit_node({:call, :-, [operand], ret_type}, ctx) do
     {src_reg, ctx} = emit_node(operand, ctx)
     ctx = maybe_free_reg(ctx, src_reg)
     {dst, ctx} = alloc_reg(ctx)
     ctx = push(ctx, {:mov_imm, dst, 0})
-    ctx = push(ctx, {:alu64_reg, :sub, dst, src_reg})
+    ctx = push(ctx, alu_insn(:sub, :reg, dst, src_reg, ret_type))
     {dst, ctx}
   end
 
@@ -462,7 +465,7 @@ defmodule VaistoBpf.Emitter do
   end
 
   # for-range loop: bounded loop with JGE/JA
-  defp emit_node({:for_range, var, start_expr, end_expr, body, _iter_type}, ctx) do
+  defp emit_node({:for_range, var, start_expr, end_expr, body, iter_type}, ctx) do
     # Emit start and end values
     {start_reg, ctx} = emit_node(start_expr, ctx)
     {end_reg, ctx} = emit_node(end_expr, ctx)
@@ -489,7 +492,7 @@ defmodule VaistoBpf.Emitter do
     ctx = maybe_free_reg(ctx, body_reg)
 
     # iter += 1
-    ctx = push(ctx, {:alu64_imm, :add, iter_reg, 1})
+    ctx = push(ctx, alu_insn(:add, :imm, iter_reg, 1, iter_type))
     # goto loop (backward jump)
     ctx = push(ctx, {:ja, loop_label})
 
@@ -820,6 +823,12 @@ defmodule VaistoBpf.Emitter do
   # ============================================================================
   # ALU Instruction Helpers
   # ============================================================================
+
+  # Select signed ALU variant when operand type is signed
+  defp maybe_signed_alu_op(:div, type), do: if(Types.signed?(type), do: :sdiv, else: :div)
+  defp maybe_signed_alu_op(:mod, type), do: if(Types.signed?(type), do: :smod, else: :mod)
+  defp maybe_signed_alu_op(:rsh, type), do: if(Types.signed?(type), do: :arsh, else: :rsh)
+  defp maybe_signed_alu_op(op, _type), do: op
 
   defp alu_insn(op, :imm, dst, imm, type) do
     if is_64bit?(type), do: {:alu64_imm, op, dst, imm}, else: {:alu32_imm, op, dst, imm}

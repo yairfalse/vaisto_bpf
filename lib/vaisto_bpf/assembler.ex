@@ -25,8 +25,13 @@ defmodule VaistoBpf.Assembler do
     rsh: Types.alu_rsh(),
     neg: Types.alu_neg(),
     mov: Types.alu_mov(),
-    arsh: Types.alu_arsh()
+    arsh: Types.alu_arsh(),
+    sdiv: Types.alu_div(),
+    smod: Types.alu_mod()
   }
+
+  # Ops that encode signedness via offset=1 (SDIV/SMOD, kernel 5.13+)
+  @signed_offset_ops MapSet.new([:sdiv, :smod])
 
   @jmp_op_map %{
     jeq: Types.jmp_jeq(),
@@ -111,19 +116,27 @@ defmodule VaistoBpf.Assembler do
   end
 
   defp emit_instruction({:alu64_imm, op, dst, imm}, _idx, _labels) do
-    Types.encode(Types.alu64_imm(resolve_alu_op(op), dst, imm))
+    insn = Types.alu64_imm(resolve_alu_op(op), dst, imm)
+    insn = if op in @signed_offset_ops, do: %{insn | offset: 1}, else: insn
+    Types.encode(insn)
   end
 
   defp emit_instruction({:alu64_reg, op, dst, src}, _idx, _labels) do
-    Types.encode(Types.alu64_reg(resolve_alu_op(op), dst, src))
+    insn = Types.alu64_reg(resolve_alu_op(op), dst, src)
+    insn = if op in @signed_offset_ops, do: %{insn | offset: 1}, else: insn
+    Types.encode(insn)
   end
 
   defp emit_instruction({:alu32_imm, op, dst, imm}, _idx, _labels) do
-    Types.encode(Types.alu32_imm(resolve_alu_op(op), dst, imm))
+    insn = Types.alu32_imm(resolve_alu_op(op), dst, imm)
+    insn = if op in @signed_offset_ops, do: %{insn | offset: 1}, else: insn
+    Types.encode(insn)
   end
 
   defp emit_instruction({:alu32_reg, op, dst, src}, _idx, _labels) do
-    Types.encode(Types.alu32_reg(resolve_alu_op(op), dst, src))
+    insn = Types.alu32_reg(resolve_alu_op(op), dst, src)
+    insn = if op in @signed_offset_ops, do: %{insn | offset: 1}, else: insn
+    Types.encode(insn)
   end
 
   defp emit_instruction({:jmp_imm, op, dst, imm, label}, idx, labels) do
