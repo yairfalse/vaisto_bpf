@@ -212,8 +212,8 @@ defmodule VaistoBpf.SignedArithmeticTest do
       ast = {:call, :==, [{:var, :x, :i32}, {:var, :y, :i32}], :bool}
       ir = compile_to_ir(wrap_in_fn(:eq_test, [:x, :y], ast, [:i32, :i32], :bool))
 
-      # Should use jeq, not any signed ALU variant
-      assert Enum.any?(ir, &match?({:jmp_reg, :jeq, _, _, _}, &1))
+      # Should use jeq (32-bit since operands are i32), not any signed ALU variant
+      assert Enum.any?(ir, &match?({:jmp32_reg, :jeq, _, _, _}, &1))
     end
   end
 end

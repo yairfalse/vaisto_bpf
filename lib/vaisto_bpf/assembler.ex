@@ -152,6 +152,18 @@ defmodule VaistoBpf.Assembler do
     Types.encode(Types.jmp_reg(resolve_jmp_op(op), dst, src, offset))
   end
 
+  defp emit_instruction({:jmp32_imm, op, dst, imm, label}, idx, labels) do
+    target = Map.fetch!(labels, label)
+    offset = target - (idx + 1)
+    Types.encode(Types.jmp32_imm(resolve_jmp_op(op), dst, imm, offset))
+  end
+
+  defp emit_instruction({:jmp32_reg, op, dst, src, label}, idx, labels) do
+    target = Map.fetch!(labels, label)
+    offset = target - (idx + 1)
+    Types.encode(Types.jmp32_reg(resolve_jmp_op(op), dst, src, offset))
+  end
+
   defp emit_instruction({:ja, label}, idx, labels) do
     target = Map.fetch!(labels, label)
     offset = target - (idx + 1)

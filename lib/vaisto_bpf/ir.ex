@@ -18,12 +18,16 @@ defmodule VaistoBpf.IR do
           | {:alu32_reg, atom(), register(), register()}
           | {:jmp_imm, atom(), register(), integer(), label()}
           | {:jmp_reg, atom(), register(), register(), label()}
+          | {:jmp32_imm, atom(), register(), integer(), label()}
+          | {:jmp32_reg, atom(), register(), register(), label()}
           | {:ja, label()}
           | {:label, label()}
           | {:call, non_neg_integer()}
           | {:ld_map_fd, register(), non_neg_integer()}
           | {:ldx_mem, atom(), register(), register(), integer()}
           | {:stx_mem, atom(), register(), register(), integer()}
+          | {:call_fn, label()}
+          | {:endian, atom(), non_neg_integer(), register()}
           | :exit
 
   @type program :: [instruction()]

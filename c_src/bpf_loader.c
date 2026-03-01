@@ -12,6 +12,8 @@
  *   MAP_DELETE          (0x05): [0x05][handle:4LE][name_len:1][name:N][key_len:4LE][key:N]
  *   SUBSCRIBE_RINGBUF   (0x06): [0x06][handle:4LE][name_len:1][name:N]
  *   UNSUBSCRIBE_RINGBUF (0x07): [0x07][handle:4LE][name_len:1][name:N]
+ *   MAP_GET_NEXT_KEY    (0x08): [0x08][handle:4LE][name_len:1][name:N][key_len:4LE][key:N]
+ *                               key_len=0 means "get first key"
  *
  * Responses:
  *   OK (load):              [0x00][handle:4LE][num_maps:1]([name_len:1][name:N])*
@@ -46,6 +48,7 @@
 #define CMD_MAP_DELETE        0x05
 #define CMD_SUBSCRIBE_RINGBUF   0x06
 #define CMD_UNSUBSCRIBE_RINGBUF 0x07
+#define CMD_MAP_GET_NEXT_KEY    0x08
 
 #define RESP_OK        0x00
 #define RESP_ERROR     0x01
@@ -457,6 +460,57 @@ static void handle_map_delete(const uint8_t *data, uint16_t len) {
     }
 }
 
+static void handle_map_get_next_key(const uint8_t *data, uint16_t len) {
+    uint32_t handle;
+    char map_name[256];
+    const uint8_t *rest;
+    uint16_t rest_len;
+
+    if (parse_handle_and_map(data, len, &handle, map_name, &rest, &rest_len) < 0) {
+        send_error("map_get_next_key: parse error");
+        return;
+    }
+
+    /* Parse key_len and optional key (key_len=0 means "get first key") */
+    if (rest_len < 4) { send_error("map_get_next_key: missing key_len"); return; }
+    uint32_t key_len = read_le32(rest);
+    if (rest_len < 4 + key_len) { send_error("map_get_next_key: truncated key"); return; }
+    const uint8_t *key = (key_len > 0) ? (rest + 4) : NULL;
+
+    struct bpf_map *map = find_map(handle, map_name);
+    if (!map) { send_error("map_get_next_key: map not found"); return; }
+
+    int fd = bpf_map__fd(map);
+    if (fd < 0) { send_error("map_get_next_key: bad map fd"); return; }
+
+    uint32_t map_key_size = bpf_map__key_size(map);
+    if (map_key_size > UINT16_MAX - 5) { send_error("map_get_next_key: key too large"); return; }
+    uint8_t *next_key = malloc(map_key_size);
+    if (!next_key) { send_error("map_get_next_key: alloc failed"); return; }
+
+    if (bpf_map_get_next_key(fd, key, next_key) == 0) {
+        /* Found: [0x00][key_len:4LE][next_key:N] */
+        uint16_t resp_len = (uint16_t)(1 + 4 + map_key_size);
+        uint8_t *resp = malloc(resp_len);
+        if (!resp) { free(next_key); send_error("map_get_next_key: alloc resp failed"); return; }
+        resp[0] = RESP_OK;
+        write_le32(resp + 1, map_key_size);
+        memcpy(resp + 5, next_key, map_key_size);
+        write_frame(resp, resp_len);
+        free(resp);
+    } else if (errno == ENOENT) {
+        /* No more keys: [0x02] */
+        uint8_t resp[1] = { RESP_NOT_FOUND };
+        write_frame(resp, 1);
+    } else {
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "map_get_next_key: failed: %s", strerror(errno));
+        send_error(errbuf);
+    }
+
+    free(next_key);
+}
+
 /* --- Ring buffer event callback --- */
 
 static int ringbuf_event_cb(void *ctx, void *data, size_t data_sz) {
@@ -671,6 +725,9 @@ static void dispatch_command(uint8_t *frame, uint16_t frame_len) {
         break;
     case CMD_UNSUBSCRIBE_RINGBUF:
         handle_unsubscribe_ringbuf(payload, payload_len);
+        break;
+    case CMD_MAP_GET_NEXT_KEY:
+        handle_map_get_next_key(payload, payload_len);
         break;
     default: {
         char errbuf[64];

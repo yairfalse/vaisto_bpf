@@ -267,14 +267,24 @@ defmodule VaistoBpf.Types do
     %__MODULE__{opcode: op ||| @bpf_x ||| @bpf_alu, dst: dst, src: src, offset: 0, imm: 0}
   end
 
-  @doc "Conditional jump: if dst OP imm goto +offset"
+  @doc "Conditional jump (64-bit): if dst OP imm goto +offset"
   def jmp_imm(op, dst, imm, offset) do
     %__MODULE__{opcode: op ||| @bpf_k ||| @bpf_jmp, dst: dst, src: 0, offset: offset, imm: imm}
   end
 
-  @doc "Conditional jump: if dst OP src goto +offset"
+  @doc "Conditional jump (64-bit): if dst OP src goto +offset"
   def jmp_reg(op, dst, src, offset) do
     %__MODULE__{opcode: op ||| @bpf_x ||| @bpf_jmp, dst: dst, src: src, offset: offset, imm: 0}
+  end
+
+  @doc "Conditional jump (32-bit): if (u32)dst OP imm goto +offset"
+  def jmp32_imm(op, dst, imm, offset) do
+    %__MODULE__{opcode: op ||| @bpf_k ||| @bpf_jmp32, dst: dst, src: 0, offset: offset, imm: imm}
+  end
+
+  @doc "Conditional jump (32-bit): if (u32)dst OP (u32)src goto +offset"
+  def jmp32_reg(op, dst, src, offset) do
+    %__MODULE__{opcode: op ||| @bpf_x ||| @bpf_jmp32, dst: dst, src: src, offset: offset, imm: 0}
   end
 
   @doc "Unconditional jump: goto +offset"

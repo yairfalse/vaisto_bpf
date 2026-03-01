@@ -867,13 +867,7 @@ defmodule VaistoBpf.BpfTypeChecker do
       {name, defs} when is_atom(name) and is_map(defs) ->
         case Map.fetch(defs, name) do
           {:ok, md} ->
-            vt = md.value_type
-            # If value_type is a record name (capitalized), use {:ptr, RecordName}
-            if is_atom(vt) and Atom.to_string(vt) =~ ~r/^[A-Z]/ do
-              {:ptr, vt}
-            else
-              {:ptr, vt}
-            end
+            {:ptr, md.value_type}
           :error -> {:ptr, :u64}
         end
       _ -> {:ptr, :u64}

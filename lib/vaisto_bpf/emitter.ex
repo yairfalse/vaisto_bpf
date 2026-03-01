@@ -306,12 +306,17 @@ defmodule VaistoBpf.Emitter do
   # Comparison operations — produce 0 or 1
   defp emit_node({:call, op, [left, right], _ret_type}, ctx)
        when is_map_key(@comparison_ops, op) do
+    operand_t = operand_type(left) || operand_type(right)
+
     jmp_op =
-      if Types.signed?(operand_type(left) || operand_type(right)) do
+      if Types.signed?(operand_t) do
         Map.get(@signed_comparison_ops, op, Map.fetch!(@comparison_ops, op))
       else
         Map.fetch!(@comparison_ops, op)
       end
+
+    # Use JMP32 for 32-bit operands, JMP (64-bit) otherwise
+    jmp_class = if is_32bit?(operand_t), do: :jmp32_reg, else: :jmp_reg
 
     {left_reg, ctx} = emit_node(left, ctx)
     {right_reg, ctx} = emit_node(right, ctx)
@@ -323,7 +328,7 @@ defmodule VaistoBpf.Emitter do
 
     # result = 0; if left OP right goto true; goto end; true: result = 1; end:
     ctx = push(ctx, {:mov_imm, result_reg, 0})
-    ctx = push(ctx, {:jmp_reg, jmp_op, left_reg, right_reg, true_label})
+    ctx = push(ctx, {jmp_class, jmp_op, left_reg, right_reg, true_label})
     ctx = push(ctx, {:ja, end_label})
     ctx = push(ctx, {:label, true_label})
     ctx = push(ctx, {:mov_imm, result_reg, 1})
@@ -485,7 +490,8 @@ defmodule VaistoBpf.Emitter do
     # loop:
     ctx = push(ctx, {:label, loop_label})
     # if iter >= end, goto done
-    ctx = push(ctx, {:jmp_reg, :jge, iter_reg, end_reg, done_label})
+    jmp_class = if is_32bit?(iter_type), do: :jmp32_reg, else: :jmp_reg
+    ctx = push(ctx, {jmp_class, :jge, iter_reg, end_reg, done_label})
 
     # body (result discarded)
     {body_reg, ctx} = emit_node(body, ctx)
@@ -841,6 +847,9 @@ defmodule VaistoBpf.Emitter do
   defp is_64bit?(type) when type in [:u64, :i64], do: true
   defp is_64bit?({:fn, _, ret}), do: is_64bit?(ret)
   defp is_64bit?(_), do: false
+
+  defp is_32bit?(type) when type in [:u32, :i32], do: true
+  defp is_32bit?(_), do: false
 
   # Extract the BPF type from a typed AST operand (nil if untyped)
   defp operand_type({:var, _name, type}), do: type

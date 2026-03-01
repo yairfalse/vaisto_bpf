@@ -50,6 +50,35 @@ defmodule VaistoBpf.Loader do
     GenServer.call(server, {:map_delete, handle, map_name, key}, :infinity)
   end
 
+  @doc """
+  Get the next key in a BPF map after `key`.
+  Pass `nil` as key to get the first key.
+  Returns `{:ok, next_key}` or `{:ok, nil}` when iteration is complete.
+  """
+  @spec map_get_next_key(GenServer.server(), non_neg_integer(), String.t(), binary() | nil) ::
+          {:ok, binary() | nil} | {:error, String.t()}
+  def map_get_next_key(server, handle, map_name, key \\ nil) do
+    GenServer.call(server, {:map_get_next_key, handle, map_name, key}, :infinity)
+  end
+
+  @doc """
+  Return all keys in a BPF map as a list of binaries.
+  Iterates using `map_get_next_key` until exhausted.
+  """
+  @spec map_keys(GenServer.server(), non_neg_integer(), String.t()) ::
+          {:ok, [binary()]} | {:error, String.t()}
+  def map_keys(server, handle, map_name) do
+    collect_keys(server, handle, map_name, nil, [])
+  end
+
+  defp collect_keys(server, handle, map_name, current_key, acc) do
+    case map_get_next_key(server, handle, map_name, current_key) do
+      {:ok, nil} -> {:ok, Enum.reverse(acc)}
+      {:ok, next_key} -> collect_keys(server, handle, map_name, next_key, [next_key | acc])
+      {:error, _} = err -> err
+    end
+  end
+
   @doc "Compile Vaisto source to ELF, then load and attach as XDP on `interface`."
   @spec load_xdp_source(GenServer.server(), String.t(), String.t()) ::
           {:ok, non_neg_integer(), [String.t()]} | {:error, String.t()}
@@ -144,6 +173,12 @@ defmodule VaistoBpf.Loader do
     {:noreply, %{state | pending: {from, :map_delete, nil}}}
   end
 
+  def handle_call({:map_get_next_key, handle, map_name, key}, from, %{pending: nil} = state) do
+    data = Protocol.encode_map_get_next_key(handle, map_name, key)
+    Port.command(state.port, data)
+    {:noreply, %{state | pending: {from, :map_get_next_key, nil}}}
+  end
+
   def handle_call({:subscribe_ringbuf, handle, map_name, pid}, from, %{pending: nil} = state) do
     key = {handle, map_name}
     current = Map.get(state.subscribers, key, MapSet.new())
@@ -215,7 +250,7 @@ defmodule VaistoBpf.Loader do
 
           {:reply_state, {:ok, handle, map_names}, %{state | handles: new_handles}}
 
-        {:ok, value} when cmd in [:map_lookup] ->
+        {:ok, value} when cmd in [:map_lookup, :map_get_next_key] ->
           {:reply_state, {:ok, value}, state}
 
         :ok when cmd == :detach ->

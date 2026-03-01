@@ -13,6 +13,7 @@ defmodule VaistoBpf.Loader.Protocol do
   @cmd_map_delete 0x05
   @cmd_subscribe_ringbuf 0x06
   @cmd_unsubscribe_ringbuf 0x07
+  @cmd_map_get_next_key 0x08
 
   @resp_ok 0x00
   @resp_error 0x01
@@ -77,6 +78,26 @@ defmodule VaistoBpf.Loader.Protocol do
       key_len::little-32, key::binary>>
   end
 
+  @spec encode_map_get_next_key(non_neg_integer(), String.t(), binary() | nil) :: binary()
+  def encode_map_get_next_key(handle, map_name, key \\ nil)
+      when is_integer(handle) and handle >= 0 and is_binary(map_name)
+           and byte_size(map_name) <= @max_map_name_len do
+    name_len = byte_size(map_name)
+
+    case key do
+      nil ->
+        <<@cmd_map_get_next_key::8, handle::little-32,
+          name_len::8, map_name::binary,
+          0::little-32>>
+
+      key when is_binary(key) ->
+        key_len = byte_size(key)
+        <<@cmd_map_get_next_key::8, handle::little-32,
+          name_len::8, map_name::binary,
+          key_len::little-32, key::binary>>
+    end
+  end
+
   @spec encode_subscribe_ringbuf(non_neg_integer(), String.t()) :: binary()
   def encode_subscribe_ringbuf(handle, map_name)
       when is_integer(handle) and handle >= 0 and is_binary(map_name)
@@ -93,7 +114,7 @@ defmodule VaistoBpf.Loader.Protocol do
     <<@cmd_unsubscribe_ringbuf::8, handle::little-32, name_len::8, map_name::binary>>
   end
 
-  @spec decode_response(:load_xdp | :detach | :map_lookup | :map_update | :map_delete, binary()) ::
+  @spec decode_response(:load_xdp | :detach | :map_lookup | :map_update | :map_delete | :map_get_next_key, binary()) ::
           {:ok, map()} | :ok | {:error, String.t()}
   def decode_response(:load_xdp, <<@resp_ok, handle::little-32, num_maps::8, rest::binary>>) do
     case decode_map_names(rest, num_maps, []) do
@@ -124,6 +145,14 @@ defmodule VaistoBpf.Loader.Protocol do
 
   def decode_response(:map_delete, <<@resp_not_found>>) do
     :ok
+  end
+
+  def decode_response(:map_get_next_key, <<@resp_ok, key_len::little-32, key::binary-size(key_len)>>) do
+    {:ok, key}
+  end
+
+  def decode_response(:map_get_next_key, <<@resp_not_found>>) do
+    {:ok, nil}
   end
 
   def decode_response(:subscribe_ringbuf, <<@resp_ok>>) do
