@@ -16,6 +16,23 @@ defmodule VaistoBpf.Loader do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   end
 
+  @doc """
+  Load a BPF program from an ELF binary and attach it.
+
+  `prog_type` is an atom: `:xdp`, `:kprobe`, `:tracepoint`, etc.
+  `attach_target` depends on the program type:
+    - `:xdp` / `:tc` — network interface name (e.g. "eth0")
+    - `:kprobe` / `:kretprobe` — kernel function name (e.g. "do_sys_open")
+    - `:tracepoint` — "category/event" (e.g. "syscalls/sys_enter_openat")
+    - `:uprobe` / `:uretprobe` — "pid:binary_path:offset" (e.g. "0:/usr/bin/bash:0x4245")
+    - `:auto` — inferred from ELF section name
+  """
+  @spec load(GenServer.server(), binary(), atom(), String.t()) ::
+          {:ok, non_neg_integer(), [String.t()]} | {:error, String.t()}
+  def load(server, elf_binary, prog_type, attach_target) do
+    GenServer.call(server, {:load, elf_binary, prog_type, attach_target}, :infinity)
+  end
+
   @doc "Load an XDP program from an ELF binary and attach it to `interface`."
   @spec load_xdp(GenServer.server(), binary(), String.t()) ::
           {:ok, non_neg_integer(), [String.t()]} | {:error, String.t()}
@@ -90,6 +107,20 @@ defmodule VaistoBpf.Loader do
   end
 
   @doc """
+  Compile Vaisto source to ELF, then load and attach with the given program type.
+
+  If `prog_type` is `:auto`, the type is inferred from the source's `(program ...)` declaration.
+  """
+  @spec load_source(GenServer.server(), String.t(), atom(), String.t()) ::
+          {:ok, non_neg_integer(), [String.t()]} | {:error, String.t()}
+  def load_source(server, source, prog_type, attach_target) do
+    case VaistoBpf.compile_source_to_elf(source) do
+      {:ok, elf_binary} -> load(server, elf_binary, prog_type, attach_target)
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc """
   Subscribe a process to ring buffer events from a BPF map.
 
   Events arrive as `{:ringbuf_event, handle, map_name, data}` messages.
@@ -143,6 +174,12 @@ defmodule VaistoBpf.Loader do
   end
 
   @impl true
+  def handle_call({:load, elf_binary, prog_type, attach_target}, from, %{pending: nil} = state) do
+    data = Protocol.encode_load(elf_binary, prog_type, attach_target)
+    Port.command(state.port, data)
+    {:noreply, %{state | pending: {from, :load, attach_target}}}
+  end
+
   def handle_call({:load_xdp, elf_binary, interface}, from, %{pending: nil} = state) do
     data = Protocol.encode_load_xdp(elf_binary, interface)
     Port.command(state.port, data)

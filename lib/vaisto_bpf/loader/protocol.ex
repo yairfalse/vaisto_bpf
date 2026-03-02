@@ -14,11 +14,47 @@ defmodule VaistoBpf.Loader.Protocol do
   @cmd_subscribe_ringbuf 0x06
   @cmd_unsubscribe_ringbuf 0x07
   @cmd_map_get_next_key 0x08
+  @cmd_load 0x09
 
   @resp_ok 0x00
   @resp_error 0x01
   @resp_not_found 0x02
   @resp_ringbuf_event 0x10
+
+  # Program type byte values (must match C side)
+  @prog_type_auto 0
+  @prog_type_xdp 1
+  @prog_type_kprobe 2
+  @prog_type_kretprobe 3
+  @prog_type_tracepoint 4
+  @prog_type_raw_tp 5
+  @prog_type_tc 6
+  @prog_type_socket_filter 7
+  @prog_type_cgroup_skb 8
+  @prog_type_uprobe 9
+  @prog_type_uretprobe 10
+
+  @prog_type_map %{
+    auto: @prog_type_auto,
+    xdp: @prog_type_xdp,
+    kprobe: @prog_type_kprobe,
+    kretprobe: @prog_type_kretprobe,
+    tracepoint: @prog_type_tracepoint,
+    raw_tracepoint: @prog_type_raw_tp,
+    tc: @prog_type_tc,
+    socket_filter: @prog_type_socket_filter,
+    cgroup_skb: @prog_type_cgroup_skb,
+    uprobe: @prog_type_uprobe,
+    uretprobe: @prog_type_uretprobe
+  }
+
+  @doc "Returns the list of supported program type atoms."
+  @spec prog_types() :: [atom()]
+  def prog_types, do: Map.keys(@prog_type_map)
+
+  @doc "Convert a program type atom to its wire byte value."
+  @spec prog_type_byte(atom()) :: non_neg_integer()
+  def prog_type_byte(type) when is_map_key(@prog_type_map, type), do: @prog_type_map[type]
 
   @spec encode_load_xdp(binary(), String.t()) :: binary()
   def encode_load_xdp(elf_binary, interface) when is_binary(elf_binary) and is_binary(interface) do
@@ -28,6 +64,22 @@ defmodule VaistoBpf.Loader.Protocol do
 
     <<@cmd_load_xdp::8, elf_size::little-32, elf_binary::binary,
       iface_len::8, iface::binary>>
+  end
+
+  @doc """
+  Encode a generic load command.
+
+  Format: [0x09][elf_size:4LE][elf:N][prog_type:1][target_len:1][target:N]
+  """
+  @spec encode_load(binary(), atom(), String.t()) :: binary()
+  def encode_load(elf_binary, prog_type, attach_target)
+      when is_binary(elf_binary) and is_atom(prog_type) and is_binary(attach_target) do
+    elf_size = byte_size(elf_binary)
+    type_byte = prog_type_byte(prog_type)
+    target_len = byte_size(attach_target)
+
+    <<@cmd_load::8, elf_size::little-32, elf_binary::binary,
+      type_byte::8, target_len::8, attach_target::binary>>
   end
 
   @spec encode_detach(non_neg_integer()) :: binary()
@@ -114,8 +166,15 @@ defmodule VaistoBpf.Loader.Protocol do
     <<@cmd_unsubscribe_ringbuf::8, handle::little-32, name_len::8, map_name::binary>>
   end
 
-  @spec decode_response(:load_xdp | :detach | :map_lookup | :map_update | :map_delete | :map_get_next_key, binary()) ::
+  @spec decode_response(atom(), binary()) ::
           {:ok, map()} | :ok | {:error, String.t()}
+  def decode_response(:load, <<@resp_ok, handle::little-32, num_maps::8, rest::binary>>) do
+    case decode_map_names(rest, num_maps, []) do
+      {:ok, names} -> {:ok, %{handle: handle, map_names: names}}
+      {:error, _} = err -> err
+    end
+  end
+
   def decode_response(:load_xdp, <<@resp_ok, handle::little-32, num_maps::8, rest::binary>>) do
     case decode_map_names(rest, num_maps, []) do
       {:ok, names} -> {:ok, %{handle: handle, map_names: names}}

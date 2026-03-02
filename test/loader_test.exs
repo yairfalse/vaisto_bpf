@@ -247,4 +247,84 @@ defmodule VaistoBpf.LoaderTest do
                Protocol.decode_response(:load_xdp, <<0xFF, 0, 0>>)
     end
   end
+
+  # -- Stream B: Generic load protocol --
+
+  describe "prog_type_byte/1" do
+    test "maps known types to byte values" do
+      assert 0 = Protocol.prog_type_byte(:auto)
+      assert 1 = Protocol.prog_type_byte(:xdp)
+      assert 2 = Protocol.prog_type_byte(:kprobe)
+      assert 3 = Protocol.prog_type_byte(:kretprobe)
+      assert 4 = Protocol.prog_type_byte(:tracepoint)
+      assert 5 = Protocol.prog_type_byte(:raw_tracepoint)
+      assert 6 = Protocol.prog_type_byte(:tc)
+      assert 7 = Protocol.prog_type_byte(:socket_filter)
+      assert 8 = Protocol.prog_type_byte(:cgroup_skb)
+      assert 9 = Protocol.prog_type_byte(:uprobe)
+      assert 10 = Protocol.prog_type_byte(:uretprobe)
+    end
+  end
+
+  describe "prog_types/0" do
+    test "returns all supported program types" do
+      types = Protocol.prog_types()
+      assert :xdp in types
+      assert :kprobe in types
+      assert :tracepoint in types
+      assert length(types) == 11
+    end
+  end
+
+  describe "encode_load/3" do
+    test "encodes XDP load command" do
+      elf = <<0x7F, "ELF">>
+      result = Protocol.encode_load(elf, :xdp, "eth0")
+
+      # cmd=0x09, elf_size=4 LE, elf data, prog_type=1, target_len=4, "eth0"
+      assert <<0x09, 4, 0, 0, 0, 0x7F, "ELF", 1, 4, "eth0">> = result
+    end
+
+    test "encodes kprobe load command" do
+      elf = <<1, 2, 3>>
+      result = Protocol.encode_load(elf, :kprobe, "do_sys_open")
+
+      assert <<0x09, 3, 0, 0, 0, 1, 2, 3, 2, 11, "do_sys_open">> = result
+    end
+
+    test "encodes tracepoint load command" do
+      elf = <<>>
+      target = "syscalls/sys_enter_openat"
+      result = Protocol.encode_load(elf, :tracepoint, target)
+
+      target_len = byte_size(target)
+      assert <<0x09, 0, 0, 0, 0, 4, ^target_len, ^target::binary>> = result
+    end
+
+    test "encodes auto type with empty target" do
+      elf = <<"x">>
+      result = Protocol.encode_load(elf, :auto, "")
+
+      assert <<0x09, 1, 0, 0, 0, "x", 0, 0>> = result
+    end
+  end
+
+  describe "decode_response/2 for :load" do
+    test "decodes OK with handle and no maps" do
+      data = <<0x00, 7, 0, 0, 0, 0>>
+      assert {:ok, %{handle: 7, map_names: []}} = Protocol.decode_response(:load, data)
+    end
+
+    test "decodes OK with handle and maps" do
+      data = <<0x00, 0, 0, 0, 0, 2, 4, "pkts", 5, "bytes">>
+
+      assert {:ok, %{handle: 0, map_names: ["pkts", "bytes"]}} =
+               Protocol.decode_response(:load, data)
+    end
+
+    test "decodes error response" do
+      data = <<0x01, "load: attach failed">>
+      assert {:error, "load: attach failed"} = Protocol.decode_response(:load, data)
+    end
+  end
 end

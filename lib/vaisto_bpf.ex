@@ -33,6 +33,7 @@ defmodule VaistoBpf do
 
   alias VaistoBpf.Preprocessor
   alias VaistoBpf.BpfTypeChecker
+  alias VaistoBpf.Safety
   alias VaistoBpf.Validator
   alias VaistoBpf.Emitter
   alias VaistoBpf.Assembler
@@ -72,6 +73,7 @@ defmodule VaistoBpf do
     normalized = Preprocessor.normalize_ast(parsed)
 
     with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps),
+         :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
          {:ok, ir} <- Emitter.emit(ast, maps),
          {:ok, instructions, _relocations} <- Assembler.assemble(ir) do
@@ -90,18 +92,20 @@ defmodule VaistoBpf do
   """
   @spec compile_source_to_elf(String.t(), keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
   def compile_source_to_elf(source, opts \\ []) do
-    {cleaned, section_name, _prog_type} = Preprocessor.extract_program(source)
+    {cleaned, section_name, prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
     with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps),
+         :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
          {:ok, ir} <- Emitter.emit(ast, maps),
          {:ok, instructions, relocations} <- Assembler.assemble(ir) do
       elf_opts = opts ++ [maps: maps, relocations: relocations]
       elf_opts = if section_name, do: Keyword.put_new(elf_opts, :section, section_name), else: elf_opts
+      elf_opts = if prog_type, do: Keyword.put_new(elf_opts, :prog_type, prog_type), else: elf_opts
       ElfWriter.to_elf(instructions, elf_opts)
     end
   end
@@ -115,6 +119,23 @@ defmodule VaistoBpf do
   def compile_to_elf(typed_ast, opts \\ []) do
     with {:ok, instructions} <- compile(typed_ast) do
       ElfWriter.to_elf(instructions, opts)
+    end
+  end
+
+  @doc """
+  Compile source and extract the program type for loading.
+
+  Returns `{:ok, elf_binary, prog_type}` where `prog_type` is an atom
+  like `:xdp`, `:kprobe`, `:tracepoint`, etc. (or `nil` for auto-detect).
+  """
+  @spec compile_source_with_type(String.t(), keyword()) ::
+          {:ok, binary(), atom() | nil} | {:error, Vaisto.Error.t()}
+  def compile_source_with_type(source, opts \\ []) do
+    {_cleaned, _section_name, prog_type} = Preprocessor.extract_program(source)
+
+    case compile_source_to_elf(source, opts) do
+      {:ok, elf} -> {:ok, elf, prog_type}
+      error -> error
     end
   end
 

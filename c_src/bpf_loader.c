@@ -14,6 +14,7 @@
  *   UNSUBSCRIBE_RINGBUF (0x07): [0x07][handle:4LE][name_len:1][name:N]
  *   MAP_GET_NEXT_KEY    (0x08): [0x08][handle:4LE][name_len:1][name:N][key_len:4LE][key:N]
  *                               key_len=0 means "get first key"
+ *   LOAD                (0x09): [0x09][elf_size:4LE][elf:N][prog_type:1][target_len:1][target:N]
  *
  * Responses:
  *   OK (load):              [0x00][handle:4LE][num_maps:1]([name_len:1][name:N])*
@@ -49,6 +50,7 @@
 #define CMD_SUBSCRIBE_RINGBUF   0x06
 #define CMD_UNSUBSCRIBE_RINGBUF 0x07
 #define CMD_MAP_GET_NEXT_KEY    0x08
+#define CMD_LOAD              0x09
 
 #define RESP_OK        0x00
 #define RESP_ERROR     0x01
@@ -59,11 +61,27 @@
 #define MAX_RESP     4096
 #define MAX_IFACE    64
 #define MAX_RINGBUFS 8
+#define MAX_TARGET   256
+
+/* Program type enum — must match Elixir Protocol.prog_type_byte/1 */
+#define PROG_TYPE_AUTO          0
+#define PROG_TYPE_XDP           1
+#define PROG_TYPE_KPROBE        2
+#define PROG_TYPE_KRETPROBE     3
+#define PROG_TYPE_TRACEPOINT    4
+#define PROG_TYPE_RAW_TP        5
+#define PROG_TYPE_TC            6
+#define PROG_TYPE_SOCKET_FILTER 7
+#define PROG_TYPE_CGROUP_SKB    8
+#define PROG_TYPE_UPROBE        9
+#define PROG_TYPE_URETPROBE     10
 
 struct loaded_obj {
     struct bpf_object *obj;
-    unsigned int ifindex;
-    uint32_t xdp_flags;
+    struct bpf_link *link;    /* generic: kprobe, tracepoint, etc. */
+    unsigned int ifindex;     /* XDP/TC only */
+    uint32_t xdp_flags;      /* XDP only */
+    uint8_t prog_type;        /* which type was loaded */
 };
 
 struct rb_sub {
@@ -243,8 +261,10 @@ static void handle_load_xdp(const uint8_t *data, uint16_t len) {
 
     /* Store in slot */
     loaded[slot].obj = obj;
+    loaded[slot].link = NULL;
     loaded[slot].ifindex = ifindex;
     loaded[slot].xdp_flags = xdp_flags;
+    loaded[slot].prog_type = PROG_TYPE_XDP;
 
     /* Collect map names */
     struct bpf_map *map;
@@ -276,6 +296,275 @@ static void handle_load_xdp(const uint8_t *data, uint16_t len) {
     free(resp);
 }
 
+/* Helper: collect map names and send load-OK response */
+static void send_load_ok(int slot, struct bpf_object *obj) {
+    struct bpf_map *map;
+    uint8_t map_names[MAX_RESP];
+    uint16_t map_pos = 0;
+    uint8_t num_maps = 0;
+
+    bpf_object__for_each_map(map, obj) {
+        const char *name = bpf_map__name(map);
+        if (!name) continue;
+        uint8_t nlen = (uint8_t)strlen(name);
+        if (map_pos + 1 + nlen > (uint16_t)sizeof(map_names)) break;
+        map_names[map_pos++] = nlen;
+        memcpy(map_names + map_pos, name, nlen);
+        map_pos += nlen;
+        num_maps++;
+    }
+
+    uint16_t resp_len = 1 + 4 + 1 + map_pos;
+    uint8_t *resp = malloc(resp_len);
+    if (!resp) { send_error("load: alloc response failed"); return; }
+    resp[0] = RESP_OK;
+    write_le32(resp + 1, (uint32_t)slot);
+    resp[5] = num_maps;
+    if (map_pos > 0) memcpy(resp + 6, map_names, map_pos);
+
+    write_frame(resp, resp_len);
+    free(resp);
+}
+
+/* Helper: open ELF from data, load into kernel, return obj + prog.
+ * Caller must close obj on error paths after this returns non-NULL. */
+static struct bpf_object *open_and_load_elf(const uint8_t *elf_data, uint32_t elf_size,
+                                             struct bpf_program **prog_out,
+                                             const char *cmd_name) {
+    char tmppath[] = "/tmp/vaisto_bpf_XXXXXX";
+    int tmpfd = mkstemp(tmppath);
+    if (tmpfd < 0) {
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "%s: mkstemp failed", cmd_name);
+        send_error(errbuf);
+        return NULL;
+    }
+
+    if (write_exact(tmpfd, elf_data, elf_size) < 0) {
+        close(tmpfd); unlink(tmppath);
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "%s: write temp file failed", cmd_name);
+        send_error(errbuf);
+        return NULL;
+    }
+    close(tmpfd);
+
+    struct bpf_object *obj = bpf_object__open(tmppath);
+    unlink(tmppath);
+
+    if (!obj) {
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "%s: bpf_object__open failed", cmd_name);
+        send_error(errbuf);
+        return NULL;
+    }
+
+    if (bpf_object__load(obj) != 0) {
+        bpf_object__close(obj);
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "%s: bpf_object__load failed", cmd_name);
+        send_error(errbuf);
+        return NULL;
+    }
+
+    struct bpf_program *prog = bpf_object__next_program(obj, NULL);
+    if (!prog) {
+        bpf_object__close(obj);
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "%s: no program found in ELF", cmd_name);
+        send_error(errbuf);
+        return NULL;
+    }
+
+    *prog_out = prog;
+    return obj;
+}
+
+static void handle_load(const uint8_t *data, uint16_t len) {
+    /* Parse: [elf_size:4LE][elf:N][prog_type:1][target_len:1][target:N] */
+    if (len < 6) { send_error("load: frame too short"); return; }
+
+    uint32_t elf_size = read_le32(data);
+    if (elf_size > (uint32_t)(len - 6)) { send_error("load: bad elf_size"); return; }
+
+    const uint8_t *elf_data = data + 4;
+    size_t after_elf = 4 + (size_t)elf_size;
+
+    uint8_t prog_type = data[after_elf];
+    uint8_t target_len = data[after_elf + 1];
+    if (target_len > (uint16_t)(len - after_elf - 2)) { send_error("load: bad target_len"); return; }
+
+    char target[MAX_TARGET + 1];
+    if (target_len > MAX_TARGET) { send_error("load: target too long"); return; }
+    memcpy(target, data + after_elf + 2, target_len);
+    target[target_len] = '\0';
+
+    /* Allocate a slot */
+    int slot = alloc_slot();
+    if (slot < 0) { send_error("load: no free slots"); return; }
+
+    /* Open + load */
+    struct bpf_program *prog;
+    struct bpf_object *obj = open_and_load_elf(elf_data, elf_size, &prog, "load");
+    if (!obj) return;
+
+    /* Initialize slot */
+    loaded[slot].obj = obj;
+    loaded[slot].link = NULL;
+    loaded[slot].ifindex = 0;
+    loaded[slot].xdp_flags = 0;
+    loaded[slot].prog_type = prog_type;
+
+    /* Attach based on program type */
+    switch (prog_type) {
+    case PROG_TYPE_AUTO:
+    case PROG_TYPE_XDP: {
+        int prog_fd = bpf_program__fd(prog);
+        if (prog_fd < 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: invalid program fd");
+            return;
+        }
+        unsigned int ifindex = if_nametoindex(target);
+        if (ifindex == 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: unknown interface '%s'", target);
+            send_error(errbuf);
+            return;
+        }
+        uint32_t xdp_flags = XDP_FLAGS_SKB_MODE;
+        if (bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL) != 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: bpf_xdp_attach failed");
+            return;
+        }
+        loaded[slot].ifindex = ifindex;
+        loaded[slot].xdp_flags = xdp_flags;
+        break;
+    }
+    case PROG_TYPE_KPROBE:
+    case PROG_TYPE_KRETPROBE: {
+        int is_retprobe = (prog_type == PROG_TYPE_KRETPROBE);
+        struct bpf_link *link = bpf_program__attach_kprobe(prog, is_retprobe, target);
+        if (!link) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_kprobe '%s' failed: %s",
+                     target, strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        break;
+    }
+    case PROG_TYPE_TRACEPOINT: {
+        /* target format: "category/event" */
+        char *slash = strchr(target, '/');
+        if (!slash) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: tracepoint target must be 'category/event'");
+            return;
+        }
+        *slash = '\0';
+        const char *tp_category = target;
+        const char *tp_name = slash + 1;
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, tp_category, tp_name);
+        if (!link) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_tracepoint '%s/%s' failed: %s",
+                     tp_category, tp_name, strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        break;
+    }
+    case PROG_TYPE_RAW_TP: {
+        struct bpf_link *link = bpf_program__attach_raw_tracepoint(prog, target);
+        if (!link) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_raw_tracepoint '%s' failed: %s",
+                     target, strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        break;
+    }
+    case PROG_TYPE_UPROBE:
+    case PROG_TYPE_URETPROBE: {
+        /* target format: "pid:binary_path:func_offset" */
+        char *first_colon = strchr(target, ':');
+        if (!first_colon) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: uprobe target must be 'pid:binary_path:offset'");
+            return;
+        }
+        *first_colon = '\0';
+        int pid = atoi(target);
+        /* pid -1 means attach to all processes */
+        if (pid == 0 && target[0] != '0') pid = -1;
+
+        char *binary_path = first_colon + 1;
+        char *second_colon = strrchr(binary_path, ':');
+        if (!second_colon) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: uprobe target must be 'pid:binary_path:offset'");
+            return;
+        }
+        *second_colon = '\0';
+        size_t func_offset = (size_t)strtoul(second_colon + 1, NULL, 0);
+
+        int is_retprobe = (prog_type == PROG_TYPE_URETPROBE);
+        struct bpf_link *link = bpf_program__attach_uprobe(
+            prog, is_retprobe, pid, binary_path, func_offset);
+        if (!link) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_uprobe '%s' offset %zu failed: %s",
+                     binary_path, func_offset, strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        break;
+    }
+    case PROG_TYPE_TC:
+    case PROG_TYPE_SOCKET_FILTER:
+    case PROG_TYPE_CGROUP_SKB: {
+        bpf_object__close(obj);
+        loaded[slot].obj = NULL;
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "load: prog_type %d not yet supported", prog_type);
+        send_error(errbuf);
+        return;
+    }
+    default: {
+        bpf_object__close(obj);
+        loaded[slot].obj = NULL;
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "load: unknown prog_type %d", prog_type);
+        send_error(errbuf);
+        return;
+    }
+    }
+
+    send_load_ok(slot, obj);
+}
+
 static void handle_detach(const uint8_t *data, uint16_t len) {
     if (len < 4) { send_error("detach: frame too short"); return; }
 
@@ -285,10 +574,18 @@ static void handle_detach(const uint8_t *data, uint16_t len) {
         return;
     }
 
-    bpf_xdp_detach(loaded[handle].ifindex, loaded[handle].xdp_flags, NULL);
+    /* Detach based on how the program was attached */
+    if (loaded[handle].link) {
+        bpf_link__destroy(loaded[handle].link);
+        loaded[handle].link = NULL;
+    }
+    if (loaded[handle].ifindex) {
+        bpf_xdp_detach(loaded[handle].ifindex, loaded[handle].xdp_flags, NULL);
+        loaded[handle].ifindex = 0;
+    }
     bpf_object__close(loaded[handle].obj);
     loaded[handle].obj = NULL;
-    loaded[handle].ifindex = 0;
+    loaded[handle].prog_type = 0;
 
     uint8_t resp[1] = { RESP_OK };
     write_frame(resp, 1);
@@ -683,7 +980,14 @@ static void cleanup_all(void) {
 
     for (int i = 0; i < MAX_OBJECTS; i++) {
         if (loaded[i].obj) {
-            bpf_xdp_detach(loaded[i].ifindex, loaded[i].xdp_flags, NULL);
+            if (loaded[i].link) {
+                bpf_link__destroy(loaded[i].link);
+                loaded[i].link = NULL;
+            }
+            if (loaded[i].ifindex) {
+                bpf_xdp_detach(loaded[i].ifindex, loaded[i].xdp_flags, NULL);
+                loaded[i].ifindex = 0;
+            }
             bpf_object__close(loaded[i].obj);
             loaded[i].obj = NULL;
         }
@@ -728,6 +1032,9 @@ static void dispatch_command(uint8_t *frame, uint16_t frame_len) {
         break;
     case CMD_MAP_GET_NEXT_KEY:
         handle_map_get_next_key(payload, payload_len);
+        break;
+    case CMD_LOAD:
+        handle_load(payload, payload_len);
         break;
     default: {
         char errbuf[64];
