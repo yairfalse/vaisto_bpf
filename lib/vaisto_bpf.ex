@@ -66,13 +66,13 @@ defmodule VaistoBpf do
   """
   @spec compile_source(String.t()) :: {:ok, [binary()]} | {:error, Vaisto.Error.t()}
   def compile_source(source) do
-    {cleaned, _section, _prog_type} = Preprocessor.extract_program(source)
+    {cleaned, _section, prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
-    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps),
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type),
          :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
          {:ok, ir} <- Emitter.emit(ast, maps),
@@ -98,7 +98,7 @@ defmodule VaistoBpf do
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
-    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps),
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type),
          :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
          {:ok, ir} <- Emitter.emit(ast, maps),
