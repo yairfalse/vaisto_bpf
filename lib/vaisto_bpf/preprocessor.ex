@@ -44,7 +44,9 @@ defmodule VaistoBpf.Preprocessor do
   @program_pattern ~r/\(program\s+:(\w+)(?:\s+"([^"]*)")?\)/
 
   @supported_program_types ~w(kprobe kretprobe uprobe uretprobe xdp tc
-    tracepoint raw_tracepoint socket_filter cgroup_skb)
+    tracepoint raw_tracepoint socket_filter cgroup_skb
+    perf_event lsm sk_msg sk_skb cgroup_sock cgroup_sock_addr
+    flow_dissector struct_ops)
 
   @doc """
   Extract `(program ...)` annotation from source text.

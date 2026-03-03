@@ -29,6 +29,31 @@ defmodule VaistoBpf.ContextTypes do
       r11: :u64, r10: :u64, r9: :u64, r8: :u64, rax: :u64, rcx: :u64,
       rdx: :u64, rsi: :u64, rdi: :u64, orig_rax: :u64, rip: :u64,
       cs: :u64, flags: :u64, rsp: :u64, ss: :u64
+    ],
+    BpfSock: [
+      bound_dev_if: :u32, family: :u32, type: :u32, protocol: :u32,
+      mark: :u32, priority: :u32, src_ip4: :u32, src_ip6_0: :u32,
+      src_ip6_1: :u32, src_ip6_2: :u32, src_ip6_3: :u32, src_port: :u32,
+      dst_ip4: :u32, dst_ip6_0: :u32, dst_ip6_1: :u32, dst_ip6_2: :u32,
+      dst_ip6_3: :u32, dst_port: :u32, state: :u32
+    ],
+    BpfSockAddr: [
+      user_family: :u32, user_ip4: :u32, user_ip6_0: :u32, user_ip6_1: :u32,
+      user_ip6_2: :u32, user_ip6_3: :u32, user_port: :u32, family: :u32,
+      type: :u32, protocol: :u32, msg_src_ip4: :u32, msg_src_ip6_0: :u32,
+      msg_src_ip6_1: :u32, msg_src_ip6_2: :u32, msg_src_ip6_3: :u32
+    ],
+    BpfSkMsg: [
+      data: :u64, data_end: :u64, family: :u32, remote_ip4: :u32,
+      remote_ip6_0: :u32, remote_ip6_1: :u32, remote_ip6_2: :u32,
+      remote_ip6_3: :u32, local_ip4: :u32, local_ip6_0: :u32,
+      local_ip6_1: :u32, local_ip6_2: :u32, local_ip6_3: :u32,
+      remote_port: :u32, local_port: :u32, size: :u32
+    ],
+    BpfFlowKeys: [
+      nhoff: :u16, thoff: :u16, addr_proto: :u16, n_proto: :u16,
+      sport: :u16, dport: :u16, is_frag: :u8, is_first_frag: :u8,
+      is_encap: :u8, ip_proto: :u8, ipv4_src: :u32, ipv4_dst: :u32
     ]
   }
 
@@ -42,7 +67,15 @@ defmodule VaistoBpf.ContextTypes do
     uprobe: :PtRegs,
     uretprobe: :PtRegs,
     tracepoint: nil,
-    raw_tracepoint: nil
+    raw_tracepoint: nil,
+    perf_event: :PtRegs,
+    lsm: nil,
+    sk_msg: :BpfSkMsg,
+    sk_skb: :SkBuff,
+    cgroup_sock: :BpfSock,
+    cgroup_sock_addr: :BpfSockAddr,
+    flow_dissector: :BpfFlowKeys,
+    struct_ops: nil
   }
 
   @doc "Returns all built-in context types as a map of name → field list."

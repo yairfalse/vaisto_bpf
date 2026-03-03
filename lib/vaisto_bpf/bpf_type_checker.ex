@@ -41,8 +41,8 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   Returns `{:ok, type, typed_ast}` or `{:error, %Vaisto.Error{}}`.
   """
-  @spec check(term(), [VaistoBpf.MapDef.t()]) :: {:ok, term(), term()} | {:error, Error.t()}
-  def check(ast, maps \\ []) do
+  @spec check(term(), [VaistoBpf.MapDef.t()], atom() | nil) :: {:ok, term(), term()} | {:error, Error.t()}
+  def check(ast, maps \\ [], prog_type \\ nil) do
     env = Enum.reduce(maps, %{}, fn md, env ->
       Map.put(env, md.name, :u64)
     end)
@@ -51,6 +51,7 @@ defmodule VaistoBpf.BpfTypeChecker do
     # Store map definitions for type refinement (e.g., map_lookup_elem returns {:ptr, RecordName})
     map_defs_lookup = Map.new(maps, fn md -> {md.name, md} end)
     env = Map.put(env, :__map_defs__, map_defs_lookup)
+    env = Map.put(env, :__prog_type__, prog_type)
     check_toplevel(ast, env)
   end
 
@@ -256,8 +257,14 @@ defmodule VaistoBpf.BpfTypeChecker do
       case check_expr(body, body_env, ret_type) do
         {:ok, body_type, typed_body} ->
           if types_compatible?(ret_type, body_type) do
-            typed_params = Enum.map(params, fn {n, _t} -> n end)
-            {:ok, fn_type, {:defn, name, typed_params, typed_body, fn_type}, Map.put(env, name, fn_type)}
+            case validate_context_params(params, env) do
+              :ok ->
+                typed_params = Enum.map(params, fn {n, _t} -> n end)
+                {:ok, fn_type, {:defn, name, typed_params, typed_body, fn_type}, Map.put(env, name, fn_type)}
+
+              {:error, _} = err ->
+                err
+            end
           else
             {:error, Error.new("return type mismatch in `#{name}`",
               expected: ret_type,
@@ -759,6 +766,36 @@ defmodule VaistoBpf.BpfTypeChecker do
   # ============================================================================
   # Type Helpers
   # ============================================================================
+
+  # Validate that context-typed parameters match the declared program type.
+  # Skips validation when prog_type is nil (no annotation) or maps to nil context.
+  defp validate_context_params(params, env) do
+    prog_type = Map.get(env, :__prog_type__)
+    expected_ctx = if prog_type, do: VaistoBpf.ContextTypes.context_for_program(prog_type)
+
+    if is_nil(prog_type) or is_nil(expected_ctx) do
+      :ok
+    else
+      context_params =
+        Enum.filter(params, fn {_name, type} ->
+          case type do
+            {:ptr, record_name} -> VaistoBpf.ContextTypes.builtin?(record_name)
+            _ -> false
+          end
+        end)
+
+      case Enum.find(context_params, fn {_name, {:ptr, record_name}} -> record_name != expected_ctx end) do
+        nil ->
+          :ok
+
+        {_name, {:ptr, actual_ctx}} ->
+          {:error, Error.new(
+            "wrong context type for :#{prog_type} program: expected #{expected_ctx}, got #{actual_ctx}",
+            hint: "the :#{prog_type} program type requires a #{expected_ctx} context parameter"
+          )}
+      end
+    end
+  end
 
   # Pre-check: peek at the type of an expression without full checking
   # Returns a type atom if known, nil otherwise

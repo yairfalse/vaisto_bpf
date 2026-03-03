@@ -272,7 +272,7 @@ defmodule VaistoBpf.LoaderTest do
       assert :xdp in types
       assert :kprobe in types
       assert :tracepoint in types
-      assert length(types) == 11
+      assert length(types) == 19
     end
   end
 

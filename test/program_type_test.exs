@@ -51,7 +51,9 @@ defmodule VaistoBpf.ProgramTypeTest do
 
     test "extracts all supported types" do
       for type <- ~w(kprobe kretprobe uprobe uretprobe xdp tc
-                     tracepoint raw_tracepoint socket_filter cgroup_skb) do
+                     tracepoint raw_tracepoint socket_filter cgroup_skb
+                     perf_event lsm sk_msg sk_skb cgroup_sock cgroup_sock_addr
+                     flow_dissector struct_ops) do
         {_cleaned, section, prog_type} = Preprocessor.extract_program("(program :#{type})")
         assert section == type
         assert prog_type == String.to_atom(type)

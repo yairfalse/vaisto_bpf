@@ -4,11 +4,15 @@ defmodule VaistoBpf.ContextTypesTest do
   alias VaistoBpf.ContextTypes
 
   describe "all/0" do
-    test "returns map with all three context types" do
+    test "returns map with all context types" do
       all = ContextTypes.all()
       assert Map.has_key?(all, :XdpMd)
       assert Map.has_key?(all, :SkBuff)
       assert Map.has_key?(all, :PtRegs)
+      assert Map.has_key?(all, :BpfSock)
+      assert Map.has_key?(all, :BpfSockAddr)
+      assert Map.has_key?(all, :BpfSkMsg)
+      assert Map.has_key?(all, :BpfFlowKeys)
     end
   end
 
@@ -59,6 +63,38 @@ defmodule VaistoBpf.ContextTypesTest do
       assert ContextTypes.context_for_program(:tracepoint) == nil
     end
 
+    test "perf_event maps to PtRegs" do
+      assert ContextTypes.context_for_program(:perf_event) == :PtRegs
+    end
+
+    test "lsm maps to nil" do
+      assert ContextTypes.context_for_program(:lsm) == nil
+    end
+
+    test "sk_msg maps to BpfSkMsg" do
+      assert ContextTypes.context_for_program(:sk_msg) == :BpfSkMsg
+    end
+
+    test "sk_skb maps to SkBuff" do
+      assert ContextTypes.context_for_program(:sk_skb) == :SkBuff
+    end
+
+    test "cgroup_sock maps to BpfSock" do
+      assert ContextTypes.context_for_program(:cgroup_sock) == :BpfSock
+    end
+
+    test "cgroup_sock_addr maps to BpfSockAddr" do
+      assert ContextTypes.context_for_program(:cgroup_sock_addr) == :BpfSockAddr
+    end
+
+    test "flow_dissector maps to BpfFlowKeys" do
+      assert ContextTypes.context_for_program(:flow_dissector) == :BpfFlowKeys
+    end
+
+    test "struct_ops maps to nil" do
+      assert ContextTypes.context_for_program(:struct_ops) == nil
+    end
+
     test "unknown program type returns nil" do
       assert ContextTypes.context_for_program(:unknown) == nil
     end
@@ -69,6 +105,10 @@ defmodule VaistoBpf.ContextTypesTest do
       assert ContextTypes.builtin?(:XdpMd)
       assert ContextTypes.builtin?(:SkBuff)
       assert ContextTypes.builtin?(:PtRegs)
+      assert ContextTypes.builtin?(:BpfSock)
+      assert ContextTypes.builtin?(:BpfSockAddr)
+      assert ContextTypes.builtin?(:BpfSkMsg)
+      assert ContextTypes.builtin?(:BpfFlowKeys)
     end
 
     test "returns false for non-builtin types" do

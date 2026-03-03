@@ -33,6 +33,14 @@ defmodule VaistoBpf.Loader.Protocol do
   @prog_type_cgroup_skb 8
   @prog_type_uprobe 9
   @prog_type_uretprobe 10
+  @prog_type_perf_event 11
+  @prog_type_lsm 12
+  @prog_type_sk_msg 13
+  @prog_type_sk_skb 14
+  @prog_type_cgroup_sock 15
+  @prog_type_cgroup_sock_addr 16
+  @prog_type_flow_dissector 17
+  @prog_type_struct_ops 18
 
   @prog_type_map %{
     auto: @prog_type_auto,
@@ -45,7 +53,15 @@ defmodule VaistoBpf.Loader.Protocol do
     socket_filter: @prog_type_socket_filter,
     cgroup_skb: @prog_type_cgroup_skb,
     uprobe: @prog_type_uprobe,
-    uretprobe: @prog_type_uretprobe
+    uretprobe: @prog_type_uretprobe,
+    perf_event: @prog_type_perf_event,
+    lsm: @prog_type_lsm,
+    sk_msg: @prog_type_sk_msg,
+    sk_skb: @prog_type_sk_skb,
+    cgroup_sock: @prog_type_cgroup_sock,
+    cgroup_sock_addr: @prog_type_cgroup_sock_addr,
+    flow_dissector: @prog_type_flow_dissector,
+    struct_ops: @prog_type_struct_ops
   }
 
   @doc "Returns the list of supported program type atoms."
