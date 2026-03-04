@@ -32,6 +32,7 @@ defmodule VaistoBpf.ElfWriter do
   import Bitwise
 
   alias VaistoBpf.BTF
+  alias VaistoBpf.BTFExt
 
   # ============================================================================
   # ELF Constants
@@ -86,8 +87,10 @@ defmodule VaistoBpf.ElfWriter do
   @spec to_elf([binary()], keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
   def to_elf(instructions, opts \\ []) do
     maps = Keyword.get(opts, :maps, [])
+    globals = Keyword.get(opts, :globals, [])
+    func_sigs = Keyword.get(opts, :func_sigs, [])
 
-    if maps == [] do
+    if maps == [] and globals == [] and func_sigs == [] do
       to_elf_no_maps(instructions, opts)
     else
       to_elf_with_maps(instructions, opts)
@@ -159,46 +162,273 @@ defmodule VaistoBpf.ElfWriter do
     license = Keyword.get(opts, :license, "GPL")
     func_name = Keyword.get(opts, :function_name, "main")
     maps = Keyword.get(opts, :maps, [])
+    globals = Keyword.get(opts, :globals, [])
     relocations = Keyword.get(opts, :relocations, [])
+    func_offsets = Keyword.get(opts, :func_offsets, %{})
+    func_sigs = Keyword.get(opts, :func_sigs, [])
+    core_relos = Keyword.get(opts, :core_relos, [])
 
     text_data = IO.iodata_to_binary(instructions)
     license_data = <<license::binary, 0>>
 
-    # Generate BTF and .maps data
-    {btf_data, maps_data} = BTF.encode_for_maps(maps)
+    # Generate unified BTF for maps + functions + globals
+    {btf_data, maps_data, func_type_ids} = BTF.build_program_btf(maps, func_sigs, globals)
 
-    # Build relocations section
-    rel_data = build_relocations(relocations, length(maps))
+    # Generate BTF.ext if we have function type info
+    has_btf = maps != [] or globals != [] or func_sigs != []
+    btf_ext_data = build_btf_ext(section_name, func_name, func_offsets, func_type_ids, func_sigs, core_relos)
 
-    # String tables need all section names
-    section_names = [section_name, ".license", ".maps", ".BTF", ".rel" <> section_name,
-                     ".symtab", ".strtab", ".shstrtab"]
-    {shstrtab, shstr_offsets} = build_shstrtab(section_names)
+    # Build global section data
+    global_sections = build_global_sections(globals)
 
-    # Symbol names: func + map names
+    # Build dynamic section list:
+    # Always: text, license
+    # Conditionally: .maps, .BTF, .BTF.ext, global sections (.bss, .data, .rodata)
+    # Always: .rel.text, .symtab, .strtab, .shstrtab
+
+    # Track sections dynamically with {name, type, flags, data, align, entsize, link, info}
+    sections = [{section_name, @sht_progbits, @shf_alloc ||| @shf_execinstr, text_data, 8, 0}]
+    text_idx = 1  # .text is always section 1
+
+    sections = sections ++ [{".license", @sht_progbits, @shf_alloc, license_data, 1, 0}]
+
+    # Maps section
+    {sections, maps_idx} = if maps != [] do
+      idx = length(sections) + 1
+      {sections ++ [{".maps", @sht_progbits, @shf_alloc, maps_data, 4, 0}], idx}
+    else
+      {sections, nil}
+    end
+
+    # BTF section (always emit when we have any types)
+    sections = if has_btf do
+      sections ++ [{".BTF", @sht_progbits, 0, btf_data, 4, 0}]
+    else
+      sections
+    end
+
+    # BTF.ext section (emit when we have func_info)
+    sections = if btf_ext_data != <<>> do
+      sections ++ [{".BTF.ext", @sht_progbits, 0, btf_ext_data, 4, 0}]
+    else
+      sections
+    end
+
+    # Global data sections
+    {sections, global_section_indices} =
+      Enum.reduce(global_sections, {sections, %{}}, fn {sec_name, sec_data}, {secs, idx_map} ->
+        idx = length(secs) + 1
+        {secs ++ [{sec_name, @sht_progbits, @shf_alloc, sec_data, 8, 0}],
+         Map.put(idx_map, sec_name, idx)}
+      end)
+
+    # Now we know all data sections. Build symbols and relocations.
+    # Symbol table layout: null + func + map symbols + global section symbols + subprogram symbols
     map_names = Enum.map(maps, fn md -> Atom.to_string(md.name) end)
-    {strtab, str_name_offsets} = build_strtab([func_name | map_names])
+    global_sec_names = Enum.map(global_sections, fn {name, _} -> name end)
+    sub_names = func_offsets |> Map.keys() |> Enum.sort() |> Enum.map(&Atom.to_string/1)
+    all_sym_names = [func_name | map_names] ++ global_sec_names ++ sub_names
+
+    {strtab, str_name_offsets} = build_strtab(all_sym_names)
     func_name_offset = Map.fetch!(str_name_offsets, func_name)
 
-    # Build symbol table: null + func + map symbols
-    symtab = build_symtab_with_maps(func_name_offset, byte_size(text_data),
-                                     maps, str_name_offsets, byte_size(maps_data))
+    # Build symbol table
+    null_sym = <<0::little-32, 0::8, 0::8, 0::little-16, 0::little-64, 0::little-64>>
+    func_info = @stb_global <<< 4 ||| @stt_func
+    func_sym = <<func_name_offset::little-32, func_info::8, 0::8, 1::little-16,
+                  0::little-64, byte_size(text_data)::little-64>>
 
-    # Section data in order: text, license, maps, btf, rel, symtab, strtab, shstrtab
-    section_data = [text_data, license_data, maps_data, btf_data, rel_data, symtab, strtab, shstrtab]
-    {offsets, sh_offset} = calculate_layout(section_data)
+    # Map symbols
+    map_struct_size = if maps == [], do: 0, else: div(byte_size(maps_data), length(maps))
+    map_syms = Enum.map(maps, fn md ->
+      name_offset = Map.fetch!(str_name_offsets, Atom.to_string(md.name))
+      st_info = @stb_global <<< 4 ||| @stt_object
+      st_value = md.index * map_struct_size
+      <<name_offset::little-32, st_info::8, 0::8, maps_idx::little-16,
+        st_value::little-64, map_struct_size::little-64>>
+    end)
 
-    sh_num = 9
-    shstrndx = 8
+    # Global section symbols (STT_OBJECT for the section itself)
+    global_sym_start = 2 + length(maps)  # after null + func + maps
+    global_sec_syms = Enum.map(global_sections, fn {sec_name, sec_data} ->
+      name_offset = Map.fetch!(str_name_offsets, sec_name)
+      sec_idx = Map.fetch!(global_section_indices, sec_name)
+      st_info = @stb_global <<< 4 ||| @stt_object
+      <<name_offset::little-32, st_info::8, 0::8, sec_idx::little-16,
+        0::little-64, byte_size(sec_data)::little-64>>
+    end)
 
-    elf_header = build_elf_header(sh_offset, sh_num, shstrndx)
+    # Subprogram symbols
+    sub_syms = build_subprogram_symbols(func_offsets, str_name_offsets, byte_size(text_data))
 
-    section_headers = build_section_headers_with_maps(
-      section_data, offsets, shstr_offsets, section_name, length(maps)
-    )
+    symtab = IO.iodata_to_binary([null_sym, func_sym | map_syms] ++ global_sec_syms ++ sub_syms)
 
-    elf = IO.iodata_to_binary([elf_header, section_data, section_headers])
+    # Build relocations - split map and global relocs
+    {map_relocs, global_relocs} =
+      Enum.split_with(relocations, fn
+        {_offset, {:global, _, _}} -> false
+        _ -> true
+      end)
+
+    # Map relocations: sym_index = 2 + map_index (after null + func)
+    map_rel_entries = Enum.map(map_relocs, fn {byte_offset, map_index} ->
+      sym_index = 2 + map_index
+      r_info = (sym_index <<< 32) ||| @r_bpf_64_64
+      <<byte_offset::little-64, r_info::little-64>>
+    end)
+
+    # Global relocations: sym_index = global_sym_start + position in global_sections
+    global_sec_order = Enum.map(global_sections, fn {name, _} -> name end)
+    global_rel_entries = Enum.map(global_relocs, fn {byte_offset, {:global, section, _index}} ->
+      sec_name = section_name_for_global(section)
+      sec_pos = Enum.find_index(global_sec_order, &(&1 == sec_name))
+      sym_index = global_sym_start + sec_pos
+      r_info = (sym_index <<< 32) ||| @r_bpf_64_64
+      <<byte_offset::little-64, r_info::little-64>>
+    end)
+
+    rel_data = IO.iodata_to_binary(map_rel_entries ++ global_rel_entries)
+
+    # Now add the trailing sections: rel, symtab, strtab, shstrtab
+    rel_section_name = ".rel" <> section_name
+    all_section_names = Enum.map(sections, fn {name, _, _, _, _, _} -> name end)
+    all_section_names = all_section_names ++ [rel_section_name, ".symtab", ".strtab", ".shstrtab"]
+    {shstrtab, shstr_offsets} = build_shstrtab(all_section_names)
+
+    # Rel section indices
+    rel_idx = length(sections) + 1
+    symtab_idx = rel_idx + 1
+    strtab_idx = symtab_idx + 1
+    shstrtab_idx = strtab_idx + 1
+
+    # Build all section data in order
+    section_data_list = Enum.map(sections, fn {_, _, _, data, _, _} -> data end)
+    section_data_list = section_data_list ++ [rel_data, symtab, strtab, shstrtab]
+
+    {offsets, sh_offset} = calculate_layout(section_data_list)
+
+    sh_num = shstrtab_idx + 1
+    elf_header = build_elf_header(sh_offset, sh_num, shstrtab_idx)
+
+    # Build section headers
+    section_headers = [
+      # 0: Null
+      encode_shdr(%{sh_name: 0, sh_type: @sht_null, sh_flags: 0, sh_offset: 0,
+        sh_size: 0, sh_link: 0, sh_info: 0, sh_addralign: 0, sh_entsize: 0})
+    ]
+
+    # Data sections
+    data_shdrs =
+      sections
+      |> Enum.zip(offsets)
+      |> Enum.map(fn {{name, type, flags, data, align, entsize}, offset} ->
+        encode_shdr(%{
+          sh_name: Map.fetch!(shstr_offsets, name), sh_type: type,
+          sh_flags: flags, sh_offset: offset, sh_size: byte_size(data),
+          sh_link: 0, sh_info: 0, sh_addralign: align, sh_entsize: entsize
+        })
+      end)
+    section_headers = section_headers ++ data_shdrs
+
+    # Remaining offsets after data sections
+    remaining_offsets = Enum.drop(offsets, length(sections))
+    [rel_off, symtab_off, strtab_off, shstrtab_off] = remaining_offsets
+
+    section_headers = section_headers ++ [
+      # .rel.text (sh_link → symtab, sh_info → .text)
+      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, rel_section_name), sh_type: @sht_rel,
+        sh_flags: 0, sh_offset: rel_off, sh_size: byte_size(rel_data),
+        sh_link: symtab_idx, sh_info: text_idx, sh_addralign: 8, sh_entsize: @rel_entry_size}),
+      # .symtab (sh_link → strtab)
+      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".symtab"), sh_type: @sht_symtab,
+        sh_flags: 0, sh_offset: symtab_off, sh_size: byte_size(symtab),
+        sh_link: strtab_idx, sh_info: 1, sh_addralign: 8, sh_entsize: @sym_entry_size}),
+      # .strtab
+      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".strtab"), sh_type: @sht_strtab,
+        sh_flags: 0, sh_offset: strtab_off, sh_size: byte_size(strtab),
+        sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0}),
+      # .shstrtab
+      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".shstrtab"), sh_type: @sht_strtab,
+        sh_flags: 0, sh_offset: shstrtab_off, sh_size: byte_size(shstrtab),
+        sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0})
+    ]
+
+    elf = IO.iodata_to_binary([elf_header, section_data_list, section_headers])
     {:ok, elf}
+  end
+
+  defp build_global_sections(globals) do
+    alias VaistoBpf.GlobalDef
+
+    sections = []
+
+    bss_size = GlobalDef.section_size(globals, :bss)
+    sections = if bss_size > 0 do
+      sections ++ [{".bss", :binary.copy(<<0>>, bss_size)}]
+    else
+      sections
+    end
+
+    data_globals = Enum.filter(globals, &(&1.section == :data))
+    sections = if data_globals != [] do
+      data_bin = build_global_section_data(data_globals, GlobalDef.section_size(globals, :data))
+      sections ++ [{".data", data_bin}]
+    else
+      sections
+    end
+
+    rodata_globals = Enum.filter(globals, &(&1.section == :rodata))
+    sections = if rodata_globals != [] do
+      rodata_bin = build_global_section_data(rodata_globals, GlobalDef.section_size(globals, :rodata))
+      sections ++ [{".rodata", rodata_bin}]
+    else
+      sections
+    end
+
+    sections
+  end
+
+  defp build_global_section_data(globals, total_size) do
+    sorted = Enum.sort_by(globals, & &1.offset)
+    {bin, _pos} = Enum.reduce(sorted, {<<>>, 0}, fn gdef, {bin, pos} ->
+      # Add padding
+      padding = gdef.offset - pos
+      bin = if padding > 0, do: <<bin::binary, 0::size(padding * 8)>>, else: bin
+
+      # Add value
+      value_bin = encode_global_value(gdef.value, gdef.size)
+      {<<bin::binary, value_bin::binary>>, gdef.offset + gdef.size}
+    end)
+
+    # Pad to total size
+    remaining = total_size - byte_size(bin)
+    if remaining > 0, do: <<bin::binary, 0::size(remaining * 8)>>, else: bin
+  end
+
+  defp encode_global_value(value, size) when is_integer(value) do
+    <<value::little-size(size * 8)>>
+  end
+
+  defp section_name_for_global(:bss), do: ".bss"
+  defp section_name_for_global(:data), do: ".data"
+  defp section_name_for_global(:rodata), do: ".rodata"
+
+  # Build BTF.ext data with func_info records and optional CO-RE relocations
+  defp build_btf_ext(section_name, _func_name, func_offsets, func_type_ids, func_sigs, core_relos) do
+    entry_func_type_id =
+      case func_sigs do
+        [{name, _, _} | _] -> Map.get(func_type_ids, name)
+        _ -> nil
+      end
+
+    func_infos = BTFExt.build_func_infos(func_offsets, func_type_ids, entry_func_type_id)
+
+    if func_infos == [] and core_relos == [] do
+      <<>>
+    else
+      _ = section_name
+      BTFExt.encode(section_name, func_infos, 0, core_relos)
+    end
   end
 
   # ============================================================================
@@ -240,46 +470,33 @@ defmodule VaistoBpf.ElfWriter do
     <<null_sym::binary, func_sym::binary>>
   end
 
-  defp build_symtab_with_maps(func_name_offset, text_size, maps, str_name_offsets, maps_section_size) do
-    null_sym = <<0::little-32, 0::8, 0::8, 0::little-16, 0::little-64, 0::little-64>>
+  defp build_subprogram_symbols(func_offsets, str_name_offsets, text_size) do
+    sorted = func_offsets |> Enum.sort_by(fn {_name, offset} -> offset end)
 
-    # Function symbol: STB_GLOBAL | STT_FUNC, section index 1 (.text)
-    func_info = @stb_global <<< 4 ||| @stt_func
-    func_sym =
-      <<func_name_offset::little-32, func_info::8, 0::8, 1::little-16,
-        0::little-64, text_size::little-64>>
+    sorted
+    |> Enum.with_index()
+    |> Enum.map(fn {{name, insn_offset}, idx} ->
+      name_str = Atom.to_string(name)
+      name_offset = Map.fetch!(str_name_offsets, name_str)
+      st_value = insn_offset * 8  # byte offset
 
-    # Map symbols: STB_GLOBAL | STT_OBJECT, section index 3 (.maps)
-    map_struct_size = if maps == [], do: 0, else: div(maps_section_size, length(maps))
-    map_syms =
-      Enum.map(maps, fn md ->
-        name_offset = Map.fetch!(str_name_offsets, Atom.to_string(md.name))
-        st_info = @stb_global <<< 4 ||| @stt_object
-        st_value = md.index * map_struct_size
-        <<name_offset::little-32, st_info::8, 0::8, 3::little-16,
-          st_value::little-64, map_struct_size::little-64>>
-      end)
+      # Size: distance to next function or end of text
+      next_offset =
+        case Enum.at(sorted, idx + 1) do
+          {_, next_insn} -> next_insn * 8
+          nil -> text_size
+        end
+      st_size = next_offset - st_value
 
-    IO.iodata_to_binary([null_sym, func_sym | map_syms])
+      st_info = @stb_global <<< 4 ||| @stt_func
+      <<name_offset::little-32, st_info::8, 0::8, 1::little-16,
+        st_value::little-64, st_size::little-64>>
+    end)
   end
 
   # ============================================================================
   # Relocations
   # ============================================================================
-
-  defp build_relocations(relocations, _num_maps) do
-    # Each relocation: Elf64_Rel {r_offset: u64, r_info: u64}
-    # r_info = (sym_index << 32) | R_BPF_64_64
-    # sym_index: null=0, func=1, first_map=2, etc.
-    entries =
-      Enum.map(relocations, fn {byte_offset, map_index} ->
-        sym_index = 2 + map_index  # skip null + func symbols
-        r_info = (sym_index <<< 32) ||| @r_bpf_64_64
-        <<byte_offset::little-64, r_info::little-64>>
-      end)
-
-    IO.iodata_to_binary(entries)
-  end
 
   # ============================================================================
   # Layout Calculation
@@ -357,69 +574,6 @@ defmodule VaistoBpf.ElfWriter do
       encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".shstrtab"), sh_type: @sht_strtab,
         sh_flags: 0, sh_offset: shstrtab_off,
         sh_size: byte_size(Enum.at(section_data, 4)), sh_link: 0, sh_info: 0,
-        sh_addralign: 1, sh_entsize: 0})
-    ]
-
-    IO.iodata_to_binary(sections)
-  end
-
-  # ============================================================================
-  # Section Headers — With Maps (9 sections)
-  # ============================================================================
-
-  defp build_section_headers_with_maps(section_data, offsets, shstr_offsets, section_name, _num_maps) do
-    [text_data, _license, _maps, _btf, _rel, _symtab, _strtab, _shstrtab] = section_data
-    [text_off, license_off, maps_off, btf_off, rel_off, symtab_off, strtab_off, shstrtab_off] = offsets
-
-    rel_section_name = ".rel" <> section_name
-
-    # sh_info for symtab: first global symbol index = 1 (func sym)
-    # But we need to know the count: null(local) + func(global) + maps(global)
-    # sh_info should be the index of first non-local symbol = 1
-    symtab_sh_info = 1
-
-    sections = [
-      # 0: Null
-      encode_shdr(%{sh_name: 0, sh_type: @sht_null, sh_flags: 0, sh_offset: 0,
-        sh_size: 0, sh_link: 0, sh_info: 0, sh_addralign: 0, sh_entsize: 0}),
-      # 1: .text
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, section_name), sh_type: @sht_progbits,
-        sh_flags: @shf_alloc ||| @shf_execinstr, sh_offset: text_off,
-        sh_size: byte_size(text_data), sh_link: 0, sh_info: 0, sh_addralign: 8, sh_entsize: 0}),
-      # 2: .license
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".license"), sh_type: @sht_progbits,
-        sh_flags: @shf_alloc, sh_offset: license_off,
-        sh_size: byte_size(Enum.at(section_data, 1)), sh_link: 0, sh_info: 0,
-        sh_addralign: 1, sh_entsize: 0}),
-      # 3: .maps
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".maps"), sh_type: @sht_progbits,
-        sh_flags: @shf_alloc, sh_offset: maps_off,
-        sh_size: byte_size(Enum.at(section_data, 2)), sh_link: 0, sh_info: 0,
-        sh_addralign: 4, sh_entsize: 0}),
-      # 4: .BTF
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".BTF"), sh_type: @sht_progbits,
-        sh_flags: 0, sh_offset: btf_off,
-        sh_size: byte_size(Enum.at(section_data, 3)), sh_link: 0, sh_info: 0,
-        sh_addralign: 4, sh_entsize: 0}),
-      # 5: .rel.text (sh_link → symtab=6, sh_info → .text=1)
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, rel_section_name), sh_type: @sht_rel,
-        sh_flags: 0, sh_offset: rel_off,
-        sh_size: byte_size(Enum.at(section_data, 4)), sh_link: 6, sh_info: 1,
-        sh_addralign: 8, sh_entsize: @rel_entry_size}),
-      # 6: .symtab (sh_link → strtab=7)
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".symtab"), sh_type: @sht_symtab,
-        sh_flags: 0, sh_offset: symtab_off,
-        sh_size: byte_size(Enum.at(section_data, 5)), sh_link: 7, sh_info: symtab_sh_info,
-        sh_addralign: 8, sh_entsize: @sym_entry_size}),
-      # 7: .strtab
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".strtab"), sh_type: @sht_strtab,
-        sh_flags: 0, sh_offset: strtab_off,
-        sh_size: byte_size(Enum.at(section_data, 6)), sh_link: 0, sh_info: 0,
-        sh_addralign: 1, sh_entsize: 0}),
-      # 8: .shstrtab
-      encode_shdr(%{sh_name: Map.fetch!(shstr_offsets, ".shstrtab"), sh_type: @sht_strtab,
-        sh_flags: 0, sh_offset: shstrtab_off,
-        sh_size: byte_size(Enum.at(section_data, 7)), sh_link: 0, sh_info: 0,
         sh_addralign: 1, sh_entsize: 0})
     ]
 

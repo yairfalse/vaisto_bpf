@@ -51,6 +51,10 @@ defmodule VaistoBpf.Assembler do
 
   Returns `{:ok, instructions, relocations}` where relocations is a list of
   `{byte_offset, map_index}` tuples for LD_IMM64 map references.
+
+  Also accepts a 4-element return: `{:ok, instructions, relocations, func_offsets}`
+  where `func_offsets` is `%{atom() => non_neg_integer()}` mapping function names
+  to their instruction index.
   """
   @spec assemble([VaistoBpf.IR.instruction()]) ::
           {:ok, [binary()], [{non_neg_integer(), non_neg_integer()}]}
@@ -59,25 +63,49 @@ defmodule VaistoBpf.Assembler do
     # Pass 1: Calculate label positions (ld_map_fd counts as 2 slots)
     labels = resolve_labels(ir)
 
-    # Pass 2: Emit instructions, tracking relocations
-    {instructions, relocations, _pos} =
+    # Extract function offsets from labels (keys matching {:fn, name})
+    func_offsets =
+      labels
+      |> Enum.filter(fn {{:fn, _name}, _pos} -> true; _ -> false end)
+      |> Map.new(fn {{:fn, name}, pos} -> {name, pos} end)
+
+    # Pass 2: Emit instructions, tracking relocations and CO-RE marks
+    {instructions, relocations, core_relos, _pos} =
       ir
-      |> Enum.reject(&match?({:label, _}, &1))
-      |> Enum.reduce({[], [], 0}, fn node, {insns, relocs, pos} ->
+      |> Enum.reject(fn
+        {:label, _} -> true
+        _ -> false
+      end)
+      |> Enum.reduce({[], [], [], 0}, fn node, {insns, relocs, cores, pos} ->
         case node do
           {:ld_map_fd, dst, map_index} ->
             {insn1, insn2} = Types.ld_map_fd(dst, map_index)
             byte_offset = pos * 8
             {[Types.encode(insn2), Types.encode(insn1) | insns],
-             [{byte_offset, map_index} | relocs], pos + 2}
+             [{byte_offset, map_index} | relocs], cores, pos + 2}
+
+          {:ld_global, dst, section, global_index} ->
+            # LD_IMM64 with global variable relocation
+            {insn1, insn2} = Types.ld_map_fd(dst, 0)
+            byte_offset = pos * 8
+            {[Types.encode(insn2), Types.encode(insn1) | insns],
+             [{byte_offset, {:global, section, global_index}} | relocs], cores, pos + 2}
+
+          {:core_relo, record_name, field_name, field_index} ->
+            # CO-RE relocation mark: refers to the previous instruction
+            byte_offset = (pos - 1) * 8
+            core = %{insn_off: byte_offset, record: record_name,
+                     field: field_name, field_index: field_index}
+            {insns, relocs, [core | cores], pos}
 
           _ ->
             bin = emit_instruction(node, pos, labels)
-            {[bin | insns], relocs, pos + 1}
+            {[bin | insns], relocs, cores, pos + 1}
         end
       end)
 
-    {:ok, Enum.reverse(instructions), Enum.reverse(relocations)}
+    {:ok, Enum.reverse(instructions), Enum.reverse(relocations), func_offsets,
+     Enum.reverse(core_relos)}
   rescue
     e in RuntimeError -> {:error, Vaisto.Error.new(e.message)}
   end
@@ -95,6 +123,14 @@ defmodule VaistoBpf.Assembler do
         {:ld_map_fd, _dst, _map_index}, {labels, pos} ->
           # Wide instruction: occupies 2 slots
           {labels, pos + 2}
+
+        {:ld_global, _dst, _section, _index}, {labels, pos} ->
+          # Wide instruction: occupies 2 slots
+          {labels, pos + 2}
+
+        {:core_relo, _, _, _}, {labels, pos} ->
+          # Pseudo-instruction: occupies 0 slots
+          {labels, pos}
 
         _instruction, {labels, pos} ->
           {labels, pos + 1}
