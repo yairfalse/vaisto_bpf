@@ -51,8 +51,7 @@ defmodule VaistoBpf.BTFExt do
   """
   @spec encode(String.t(), [{non_neg_integer(), non_neg_integer()}], non_neg_integer(),
                [map()], VaistoBpf.BTF.t() | nil) :: binary()
-  def encode(section_name, func_infos, section_name_off, core_relos \\ [], btf_builder \\ nil) do
-    _ = section_name
+  def encode(_section_name, func_infos, section_name_off, core_relos \\ [], btf_builder \\ nil) do
 
     # Build func_info section
     func_info_section = build_func_info_section(func_infos, section_name_off)
@@ -130,7 +129,15 @@ defmodule VaistoBpf.BTFExt do
       Enum.map_reduce(core_relos, btf, fn relo, btf ->
         # Look up the struct's BTF type ID from the cache
         struct_name = Atom.to_string(relo.record)
-        type_id = Map.get(btf.cache, {:struct, struct_name}, 0)
+
+        type_id =
+          case Map.fetch(btf.cache, {:struct, struct_name}) do
+            {:ok, id} -> id
+            :error ->
+              raise ArgumentError,
+                    "CO-RE relocation refers to unknown struct #{inspect(struct_name)} " <>
+                      "not present in BTF cache"
+          end
 
         # Encode access string as "0:field_index" (first deref + field)
         access_str = "0:#{relo.field_index}"

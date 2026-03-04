@@ -128,8 +128,12 @@ defmodule VaistoBpf.BTF do
     add_int(b, type_name, Layout.sizeof(type_name))
   end
 
-  def add_bpf_int(%__MODULE__{} = b, type_name) when type_name in [:unit, :void, :bool] do
-    # void/unit/bool map to type_id 0 (void)
+  def add_bpf_int(%__MODULE__{} = b, :bool) do
+    add_int(b, :bool, Layout.sizeof(:bool))
+  end
+
+  def add_bpf_int(%__MODULE__{} = b, type_name) when type_name in [:unit, :void] do
+    # void/unit map to type_id 0 (void)
     {0, b}
   end
 
@@ -344,7 +348,7 @@ defmodule VaistoBpf.BTF do
       <<>>
     end
 
-    {btf_binary, maps_data, b.func_type_ids}
+    {btf_binary, maps_data, b.func_type_ids, b}
   end
 
   @doc """
@@ -354,7 +358,7 @@ defmodule VaistoBpf.BTF do
   """
   @spec encode_for_maps([MapDef.t()]) :: {binary(), binary()}
   def encode_for_maps(map_defs) do
-    {btf_binary, maps_data, _func_ids} = build_program_btf(map_defs, [], [])
+    {btf_binary, maps_data, _func_ids, _builder} = build_program_btf(map_defs, [], [])
     {btf_binary, maps_data}
   end
 

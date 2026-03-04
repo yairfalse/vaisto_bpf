@@ -49,15 +49,14 @@ defmodule VaistoBpf.Assembler do
   @doc """
   Assemble a list of IR nodes into a list of 8-byte BPF instruction binaries.
 
-  Returns `{:ok, instructions, relocations}` where relocations is a list of
-  `{byte_offset, map_index}` tuples for LD_IMM64 map references.
-
-  Also accepts a 4-element return: `{:ok, instructions, relocations, func_offsets}`
-  where `func_offsets` is `%{atom() => non_neg_integer()}` mapping function names
-  to their instruction index.
+  Returns `{:ok, instructions, relocations, func_offsets, core_relos}` where:
+  - `instructions` — list of 8-byte binaries
+  - `relocations` — list of `{byte_offset, map_index}` or `{:global, byte_offset, section, index}`
+  - `func_offsets` — `%{atom() => non_neg_integer()}` mapping function names to instruction indices
+  - `core_relos` — list of CO-RE relocation metadata maps
   """
   @spec assemble([VaistoBpf.IR.instruction()]) ::
-          {:ok, [binary()], [{non_neg_integer(), non_neg_integer()}]}
+          {:ok, [binary()], [tuple()], %{atom() => non_neg_integer()}, [map()]}
           | {:error, Vaisto.Error.t()}
   def assemble(ir) do
     # Pass 1: Calculate label positions (ld_map_fd counts as 2 slots)

@@ -98,6 +98,7 @@ struct loaded_obj {
     uint8_t prog_type;        /* which type was loaded */
     int cgroup_fd;            /* cgroup_skb/cgroup_sock/cgroup_sock_addr */
     int socket_fd;            /* socket_filter */
+    int pe_fd;                /* perf_event fd */
     struct bpf_tc_hook *tc_hook;  /* TC only */
 };
 
@@ -433,6 +434,7 @@ static void handle_load(const uint8_t *data, uint16_t len) {
     loaded[slot].prog_type = prog_type;
     loaded[slot].cgroup_fd = -1;
     loaded[slot].socket_fd = -1;
+    loaded[slot].pe_fd = -1;
     loaded[slot].tc_hook = NULL;
 
     /* Attach based on program type */
@@ -573,9 +575,16 @@ static void handle_load(const uint8_t *data, uint16_t len) {
 
         /* Save hook for cleanup — heap-allocate since LIBBPF_OPTS is stack-local */
         struct bpf_tc_hook *saved_hook = malloc(sizeof(struct bpf_tc_hook));
-        if (saved_hook) {
-            memcpy(saved_hook, &hook, sizeof(struct bpf_tc_hook));
+        if (!saved_hook) {
+            /* Treat allocation failure as load failure */
+            bpf_tc_hook_detach(&hook, &tc_opts);
+            bpf_tc_hook_destroy(&hook);
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: failed to allocate memory for tc_hook state");
+            return;
         }
+        memcpy(saved_hook, &hook, sizeof(struct bpf_tc_hook));
         loaded[slot].tc_hook = saved_hook;
         loaded[slot].ifindex = tc_ifindex;
         break;
@@ -693,7 +702,7 @@ static void handle_load(const uint8_t *data, uint16_t len) {
         attr.config = pe_config;
         attr.sample_period = 1;
 
-        /* Open perf event on all CPUs, pid=-1 for system-wide */
+        /* Open perf event on cpu 0, pid=-1 for system-wide */
         int pe_fd = syscall(__NR_perf_event_open, &attr, -1 /* pid */, 0 /* cpu */, -1, 0);
         if (pe_fd < 0) {
             bpf_object__close(obj);
@@ -715,6 +724,7 @@ static void handle_load(const uint8_t *data, uint16_t len) {
             return;
         }
         loaded[slot].link = link;
+        loaded[slot].pe_fd = pe_fd;
         break;
     }
     case PROG_TYPE_LSM: {
@@ -807,6 +817,10 @@ static void handle_detach(const uint8_t *data, uint16_t len) {
     if (loaded[handle].socket_fd >= 0) {
         close(loaded[handle].socket_fd);
         loaded[handle].socket_fd = -1;
+    }
+    if (loaded[handle].pe_fd >= 0) {
+        close(loaded[handle].pe_fd);
+        loaded[handle].pe_fd = -1;
     }
     bpf_object__close(loaded[handle].obj);
     loaded[handle].obj = NULL;
@@ -1225,6 +1239,10 @@ static void cleanup_all(void) {
             if (loaded[i].socket_fd >= 0) {
                 close(loaded[i].socket_fd);
                 loaded[i].socket_fd = -1;
+            }
+            if (loaded[i].pe_fd >= 0) {
+                close(loaded[i].pe_fd);
+                loaded[i].pe_fd = -1;
             }
             bpf_object__close(loaded[i].obj);
             loaded[i].obj = NULL;

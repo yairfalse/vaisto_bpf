@@ -24,12 +24,18 @@ defmodule VaistoBpf.Emitter do
   @doc """
   Emit BPF IR from a typed AST.
 
-  Accepts an optional list of `%MapDef{}` structs. When a variable references
-  a map name, the emitter generates `ld_map_fd` instead of a register lookup.
+  ## Parameters
+
+  - `ast` — typed AST from the type checker
+  - `maps` — list of `%MapDef{}` structs for map references
+  - `globals` — list of `%GlobalDef{}` structs for global variable references
+  - `opts` — keyword options:
+    - `:core` — when `true`, annotate field accesses with CO-RE relocation marks
 
   Returns `{:ok, instructions}` where instructions is a list of IR nodes.
   """
-  @spec emit(term(), [VaistoBpf.MapDef.t()]) :: {:ok, [VaistoBpf.IR.node()]} | {:error, Vaisto.Error.t()}
+  @spec emit(term(), [VaistoBpf.MapDef.t()], [VaistoBpf.GlobalDef.t()], keyword()) ::
+          {:ok, [VaistoBpf.IR.node()]} | {:error, Vaisto.Error.t()}
   def emit(ast, maps \\ [], globals \\ [], opts \\ []) do
     ctx = new_context(maps, globals, opts)
 
@@ -288,7 +294,9 @@ defmodule VaistoBpf.Emitter do
     ctx = push(ctx, {:stx_mem, size, addr_reg, val_reg, gdef.offset})
     ctx = free_reg(ctx, addr_reg)
     ctx = free_reg(ctx, val_reg)
-    {Types.r0(), ctx}  # set! returns :unit
+    # set! returns :unit — explicitly zero r0 so the return value is deterministic
+    ctx = push(ctx, {:mov_imm, Types.r0(), 0})
+    {Types.r0(), ctx}
   end
 
   defp emit_node({:fn_ref, _name, _arity, _type}, ctx) do

@@ -103,7 +103,7 @@ defmodule VaistoBpf do
     with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type, globals),
          :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
-         {:ok, ir} <- Emitter.emit(ast, maps, globals),
+         {:ok, ir} <- Emitter.emit(ast, maps, globals, opts),
          {:ok, instructions, relocations, func_offsets, core_relos} <- Assembler.assemble(ir) do
       func_sigs = extract_function_signatures(typed_ast)
       elf_opts = opts ++ [maps: maps, relocations: relocations, func_offsets: func_offsets,
@@ -167,12 +167,11 @@ defmodule VaistoBpf do
 
   defp extract_function_signatures(_), do: []
 
-  defp extract_param_types(params, _fn_type) do
-    Enum.map(params, fn
-      {:var, _name, type} -> normalize_btf_type(type)
-      _ -> :u64
-    end)
+  defp extract_param_types(_params, {:fn, param_types, _ret}) do
+    Enum.map(param_types, &normalize_btf_type/1)
   end
+
+  defp extract_param_types(_params, _fn_type), do: []
 
   defp extract_ret_type({:fn, _params, ret}), do: normalize_btf_type(ret)
   defp extract_ret_type(_), do: :u64

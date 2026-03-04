@@ -172,11 +172,11 @@ defmodule VaistoBpf.ElfWriter do
     license_data = <<license::binary, 0>>
 
     # Generate unified BTF for maps + functions + globals
-    {btf_data, maps_data, func_type_ids} = BTF.build_program_btf(maps, func_sigs, globals)
+    {btf_data, maps_data, func_type_ids, btf_builder} = BTF.build_program_btf(maps, func_sigs, globals)
 
     # Generate BTF.ext if we have function type info
     has_btf = maps != [] or globals != [] or func_sigs != []
-    btf_ext_data = build_btf_ext(section_name, func_name, func_offsets, func_type_ids, func_sigs, core_relos)
+    btf_ext_data = build_btf_ext(section_name, func_name, func_offsets, func_type_ids, func_sigs, core_relos, btf_builder)
 
     # Build global section data
     global_sections = build_global_sections(globals)
@@ -413,8 +413,9 @@ defmodule VaistoBpf.ElfWriter do
   defp section_name_for_global(:data), do: ".data"
   defp section_name_for_global(:rodata), do: ".rodata"
 
-  # Build BTF.ext data with func_info records and optional CO-RE relocations
-  defp build_btf_ext(section_name, _func_name, func_offsets, func_type_ids, func_sigs, core_relos) do
+  # Build BTF.ext data with func_info records and optional CO-RE relocations.
+  # Uses the BTF builder's string table to resolve the section name offset.
+  defp build_btf_ext(section_name, _func_name, func_offsets, func_type_ids, func_sigs, core_relos, btf_builder \\ nil) do
     entry_func_type_id =
       case func_sigs do
         [{name, _, _} | _] -> Map.get(func_type_ids, name)
@@ -426,8 +427,24 @@ defmodule VaistoBpf.ElfWriter do
     if func_infos == [] and core_relos == [] do
       <<>>
     else
-      _ = section_name
-      BTFExt.encode(section_name, func_infos, 0, core_relos)
+      # Look up section name offset in the BTF string table, or add it
+      {section_name_off, btf_builder} =
+        if btf_builder do
+          case Map.fetch(btf_builder.str_cache, section_name) do
+            {:ok, off} -> {off, btf_builder}
+            :error ->
+              off = byte_size(btf_builder.str_tab)
+              btf_builder = %{btf_builder |
+                str_tab: <<btf_builder.str_tab::binary, section_name::binary, 0>>,
+                str_cache: Map.put(btf_builder.str_cache, section_name, off)
+              }
+              {off, btf_builder}
+          end
+        else
+          {0, nil}
+        end
+
+      BTFExt.encode(section_name, func_infos, section_name_off, core_relos, btf_builder)
     end
   end
 

@@ -375,7 +375,7 @@ defmodule VaistoBpf.BTFTest do
       md = make_map(:counters, :hash, :u32, :u64, 1024, 0)
       functions = [{:main, [:u64], :u32}]
 
-      {btf_binary, maps_data, func_ids} = BTF.build_program_btf([md], functions, [])
+      {btf_binary, maps_data, func_ids, _builder} = BTF.build_program_btf([md], functions, [])
 
       header = parse_btf_header(btf_binary)
       assert header.magic == 0xEB9F
