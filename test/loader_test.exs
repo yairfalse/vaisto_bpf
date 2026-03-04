@@ -264,6 +264,17 @@ defmodule VaistoBpf.LoaderTest do
       assert 9 = Protocol.prog_type_byte(:uprobe)
       assert 10 = Protocol.prog_type_byte(:uretprobe)
     end
+
+    test "maps new program types 11-18 to byte values" do
+      assert 11 = Protocol.prog_type_byte(:perf_event)
+      assert 12 = Protocol.prog_type_byte(:lsm)
+      assert 13 = Protocol.prog_type_byte(:sk_msg)
+      assert 14 = Protocol.prog_type_byte(:sk_skb)
+      assert 15 = Protocol.prog_type_byte(:cgroup_sock)
+      assert 16 = Protocol.prog_type_byte(:cgroup_sock_addr)
+      assert 17 = Protocol.prog_type_byte(:flow_dissector)
+      assert 18 = Protocol.prog_type_byte(:struct_ops)
+    end
   end
 
   describe "prog_types/0" do
@@ -306,6 +317,56 @@ defmodule VaistoBpf.LoaderTest do
       result = Protocol.encode_load(elf, :auto, "")
 
       assert <<0x09, 1, 0, 0, 0, "x", 0, 0>> = result
+    end
+  end
+
+  describe "encode_load/3 for new program types" do
+    test "encodes cgroup_skb with cgroup path target" do
+      elf = <<0x7F, "ELF">>
+      result = Protocol.encode_load(elf, :cgroup_skb, "/sys/fs/cgroup")
+      assert <<0x09, 4, 0, 0, 0, 0x7F, "ELF", 8, 14, "/sys/fs/cgroup">> = result
+    end
+
+    test "encodes lsm with empty target" do
+      elf = <<1>>
+      result = Protocol.encode_load(elf, :lsm, "")
+      assert <<0x09, 1, 0, 0, 0, 1, 12, 0>> = result
+    end
+
+    test "encodes perf_event with type:config target" do
+      elf = <<>>
+      result = Protocol.encode_load(elf, :perf_event, "1:1")
+      assert <<0x09, 0, 0, 0, 0, 11, 3, "1:1">> = result
+    end
+
+    test "encodes tc with interface target" do
+      elf = <<0x7F>>
+      result = Protocol.encode_load(elf, :tc, "eth0")
+      assert <<0x09, 1, 0, 0, 0, 0x7F, 6, 4, "eth0">> = result
+    end
+
+    test "encodes struct_ops with empty target" do
+      elf = <<>>
+      result = Protocol.encode_load(elf, :struct_ops, "")
+      assert <<0x09, 0, 0, 0, 0, 18, 0>> = result
+    end
+
+    test "encodes socket_filter with empty target" do
+      elf = <<>>
+      result = Protocol.encode_load(elf, :socket_filter, "")
+      assert <<0x09, 0, 0, 0, 0, 7, 0>> = result
+    end
+
+    test "encodes cgroup_sock with cgroup path" do
+      elf = <<>>
+      result = Protocol.encode_load(elf, :cgroup_sock, "/sys/fs/cgroup")
+      assert <<0x09, 0, 0, 0, 0, 15, 14, "/sys/fs/cgroup">> = result
+    end
+
+    test "encodes cgroup_sock_addr with cgroup path" do
+      elf = <<>>
+      result = Protocol.encode_load(elf, :cgroup_sock_addr, "/sys/fs/cgroup")
+      assert <<0x09, 0, 0, 0, 0, 16, 14, "/sys/fs/cgroup">> = result
     end
   end
 
