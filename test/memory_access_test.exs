@@ -101,7 +101,7 @@ defmodule VaistoBpf.MemoryAccessTest do
 
       {:ok, instructions} = VaistoBpf.compile_source(source)
 
-      stx = find_instruction(instructions, 0x7B)
+      stx = find_instruction(instructions, 0x7B, min_offset: 0)
       assert stx != nil
       assert stx.offset == 24
     end
@@ -209,10 +209,17 @@ defmodule VaistoBpf.MemoryAccessTest do
     end)
   end
 
-  defp find_instruction(instructions, opcode) do
+  defp find_instruction(instructions, opcode, opts \\ []) do
+    min_offset = Keyword.get(opts, :min_offset, nil)
+
     Enum.find_value(instructions, fn bin ->
       decoded = Types.decode(bin)
-      if decoded.opcode == opcode, do: decoded, else: nil
+
+      match? =
+        decoded.opcode == opcode and
+          (min_offset == nil or decoded.offset >= min_offset)
+
+      if match?, do: decoded, else: nil
     end)
   end
 end

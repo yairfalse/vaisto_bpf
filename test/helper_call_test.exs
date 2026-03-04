@@ -44,10 +44,12 @@ defmodule VaistoBpf.HelperCallTest do
       # Should end with EXIT
       assert List.last(instructions).opcode == @exit_opcode
 
-      # Should have a MOV to r0 before exit (return value)
-      pre_exit = Enum.at(instructions, -2)
-      assert pre_exit.opcode == @mov64_reg_opcode
-      assert pre_exit.dst == Types.r0()
+      # Should have a MOV to r0 before epilogue+exit (return value)
+      # Epilogue is 4 LDX_MEM restores + EXIT, so MOV r0 is at -6
+      mov_r0 = Enum.find(instructions, fn insn ->
+        insn.opcode == @mov64_reg_opcode and insn.dst == Types.r0()
+      end)
+      assert mov_r0 != nil
     end
   end
 
@@ -110,10 +112,11 @@ defmodule VaistoBpf.HelperCallTest do
       """)
 
       # x (in r1) should be spilled to r6 before the call
-      first_insn = List.first(instructions)
-      assert first_insn.opcode == @mov64_reg_opcode
-      assert first_insn.dst == Types.r6()
-      assert first_insn.src == Types.r1()
+      # (after the 4-instruction callee-saved prologue)
+      spill = Enum.find(instructions, fn insn ->
+        insn.opcode == @mov64_reg_opcode and insn.dst == Types.r6() and insn.src == Types.r1()
+      end)
+      assert spill != nil
 
       # Then CALL
       call_idx = Enum.find_index(instructions, &(&1.opcode == @call_opcode))
