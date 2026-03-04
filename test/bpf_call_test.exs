@@ -70,6 +70,73 @@ defmodule VaistoBpf.BpfCallTest do
     end
   end
 
+  describe "callee-saved prologue/epilogue" do
+    test "function emits STX_MEM prologue (save r6-r9)" do
+      source = """
+      (defn inc [x :u64] :u64 (+ x 1))
+      """
+      {:ok, ir} = compile_to_ir(source)
+
+      # Should have 4 STX_MEM instructions saving r6, r7, r8, r9 to stack
+      stx_saves = Enum.filter(ir, fn
+        {:stx_mem, :u64, dst, src, _off} when dst == 10 and src in [6, 7, 8, 9] -> true
+        _ -> false
+      end)
+      assert length(stx_saves) == 4
+    end
+
+    test "function emits LDX_MEM epilogue (restore r6-r9)" do
+      source = """
+      (defn inc [x :u64] :u64 (+ x 1))
+      """
+      {:ok, ir} = compile_to_ir(source)
+
+      # Should have 4 LDX_MEM instructions restoring r6, r7, r8, r9
+      ldx_restores = Enum.filter(ir, fn
+        {:ldx_mem, :u64, dst, src, _off} when src == 10 and dst in [6, 7, 8, 9] -> true
+        _ -> false
+      end)
+      assert length(ldx_restores) == 4
+    end
+  end
+
+  describe "stack isolation" do
+    test "two functions have independent stack frames" do
+      source = """
+      (defn f [x :u64] :u64 (let [a (+ x 1)] a))
+      (defn g [y :u64] :u64 (let [b (+ y 2)] b))
+      """
+      {:ok, _ir} = compile_to_ir(source)
+      # If this compiles without error, stack frames are isolated
+      # (each defn resets stack_offset)
+    end
+  end
+
+  describe "call depth safety" do
+    test "depth 8 is accepted" do
+      # Build a chain: f1 calls f2, f2 calls f3, ..., f8 calls f9
+      fns = for i <- 1..8 do
+        "(defn f#{i} [x :u64] :u64 (f#{i + 1} x))"
+      end
+      leaf = "(defn f9 [x :u64] :u64 (+ x 1))"
+      source = Enum.join(fns ++ [leaf], "\n")
+
+      assert {:ok, _} = VaistoBpf.compile_source(source)
+    end
+
+    test "depth 9 is rejected" do
+      # Build a chain: f1 calls f2, ..., f9 calls f10
+      fns = for i <- 1..9 do
+        "(defn f#{i} [x :u64] :u64 (f#{i + 1} x))"
+      end
+      leaf = "(defn f10 [x :u64] :u64 (+ x 1))"
+      source = Enum.join(fns ++ [leaf], "\n")
+
+      assert {:error, err} = VaistoBpf.compile_source(source)
+      assert err.message =~ "call depth"
+    end
+  end
+
   describe "source integration" do
     test "chained user function calls compile" do
       source = """

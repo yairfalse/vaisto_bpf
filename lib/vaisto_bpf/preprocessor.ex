@@ -14,6 +14,7 @@ defmodule VaistoBpf.Preprocessor do
   """
 
   alias VaistoBpf.MapDef
+  alias VaistoBpf.GlobalDef
 
   # Maps lowercase BPF type atoms to their capitalized parser-friendly form,
   # and vice versa.
@@ -128,6 +129,59 @@ defmodule VaistoBpf.Preprocessor do
       {cleaned, Enum.reverse(map_defs)}
     end
   end
+
+  # Regex matching (defglobal name :type) or (defglobal name :type value)
+  @defglobal_pattern ~r/\(defglobal\s+(\w+)\s+:(\w+)(?:\s+(-?\d+))?\)/
+  # Regex matching (defconst name :type value) — value is required
+  @defconst_pattern ~r/\(defconst\s+(\w+)\s+:(\w+)\s+(-?\d+)\)/
+
+  @doc """
+  Extract `(defglobal ...)` and `(defconst ...)` forms from source text.
+
+  Returns `{cleaned_source, [%GlobalDef{}]}` with offsets assigned per section.
+  """
+  @spec extract_defglobals(String.t()) :: {String.t(), [GlobalDef.t()]}
+  def extract_defglobals(source) do
+    global_matches = Regex.scan(@defglobal_pattern, source)
+    const_matches = Regex.scan(@defconst_pattern, source)
+
+    if global_matches == [] and const_matches == [] do
+      {source, []}
+    else
+      {source, globals, _idx} =
+        Enum.reduce(global_matches, {source, [], 0}, fn match, {src, defs, idx} ->
+          {full, name, type, value} = parse_global_match(match)
+          replacement = String.duplicate(" ", String.length(full))
+          src = String.replace(src, full, replacement, global: false)
+
+          {:ok, gdef} = GlobalDef.new(
+            String.to_atom(name), String.to_atom(type), value, false, idx
+          )
+
+          {src, [gdef | defs], idx + 1}
+        end)
+
+      {source, globals, _idx} =
+        Enum.reduce(const_matches, {source, globals, length(globals)}, fn
+          [full, name, type, value_str], {src, defs, idx} ->
+            replacement = String.duplicate(" ", String.length(full))
+            src = String.replace(src, full, replacement, global: false)
+
+            {:ok, gdef} = GlobalDef.new(
+              String.to_atom(name), String.to_atom(type),
+              String.to_integer(value_str), true, idx
+            )
+
+            {src, [gdef | defs], idx + 1}
+        end)
+
+      assigned = globals |> Enum.reverse() |> GlobalDef.assign_offsets()
+      {source, assigned}
+    end
+  end
+
+  defp parse_global_match([full, name, type]), do: {full, name, type, nil}
+  defp parse_global_match([full, name, type, value_str]), do: {full, name, type, String.to_integer(value_str)}
 
   @doc """
   Walk a parsed AST and normalize capitalized BPF types back to lowercase.

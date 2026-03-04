@@ -298,7 +298,129 @@ defmodule VaistoBpf.BTFTest do
   defp type_extra_bytes(2, _vlen), do: 0           # PTR: no extra data
   defp type_extra_bytes(3, _vlen), do: 12          # ARRAY: 12-byte info
   defp type_extra_bytes(4, vlen), do: vlen * 12    # STRUCT: 12 bytes per member
+  defp type_extra_bytes(12, _vlen), do: 0          # FUNC: no extra data
+  defp type_extra_bytes(13, vlen), do: vlen * 8    # FUNC_PROTO: 8 bytes per param
   defp type_extra_bytes(14, _vlen), do: 4          # VAR: 4-byte linkage
   defp type_extra_bytes(15, vlen), do: vlen * 12   # DATASEC: 12 bytes per var
   defp type_extra_bytes(_kind, _vlen), do: 0
+
+  # ============================================================================
+  # Tests: BTF Builder
+  # ============================================================================
+
+  describe "BTF builder" do
+    test "new builder produces valid empty BTF" do
+      btf = BTF.new() |> BTF.encode()
+      header = parse_btf_header(btf)
+
+      assert header.magic == 0xEB9F
+      assert header.version == 1
+      assert header.type_len == 0
+      assert header.str_len == 1  # just the null byte
+    end
+
+    test "add_int deduplicates same type" do
+      b = BTF.new()
+      {id1, b} = BTF.add_int(b, :u32, 4)
+      {id2, b} = BTF.add_int(b, :u32, 4)
+
+      assert id1 == id2
+      # Type section should have only 1 INT (16 bytes)
+      assert byte_size(b.types) == 16
+    end
+
+    test "add_int assigns different IDs to different types" do
+      b = BTF.new()
+      {id1, b} = BTF.add_int(b, :u32, 4)
+      {id2, _b} = BTF.add_int(b, :u64, 8)
+
+      assert id1 != id2
+      assert id1 == 1
+      assert id2 == 2
+    end
+
+    test "add_func creates FUNC_PROTO + FUNC pair" do
+      b = BTF.new()
+      {func_id, b} = BTF.add_func(b, :my_func, [:u64, :u32], :u64)
+
+      btf = BTF.encode(b)
+      type_section = extract_type_section(btf)
+
+      # Should have INTs + FUNC_PROTO + FUNC
+      func_protos = find_types_by_kind(type_section, 13)
+      assert length(func_protos) == 1
+      assert hd(func_protos).vlen == 2  # 2 params
+
+      funcs = find_types_by_kind(type_section, 12)
+      assert length(funcs) == 1
+
+      # func_type_ids should map the name
+      assert BTF.func_type_ids(b) == %{my_func: func_id}
+    end
+
+    test "add_func with void return uses type_id 0" do
+      b = BTF.new()
+      {_id, b} = BTF.add_func(b, :noop, [], :unit)
+
+      btf = BTF.encode(b)
+      type_section = extract_type_section(btf)
+
+      func_protos = find_types_by_kind(type_section, 13)
+      assert length(func_protos) == 1
+      # ret_type should be 0 (void) — check size_or_type field
+      assert hd(func_protos).size_or_type == 0
+    end
+
+    test "build_program_btf with maps and functions" do
+      md = make_map(:counters, :hash, :u32, :u64, 1024, 0)
+      functions = [{:main, [:u64], :u32}]
+
+      {btf_binary, maps_data, func_ids, _builder} = BTF.build_program_btf([md], functions, [])
+
+      header = parse_btf_header(btf_binary)
+      assert header.magic == 0xEB9F
+      assert byte_size(maps_data) == 32
+
+      type_section = extract_type_section(btf_binary)
+      # Should have both map types and function types
+      datasecs = find_types_by_kind(type_section, 15)
+      assert length(datasecs) >= 1
+
+      funcs = find_types_by_kind(type_section, 12)
+      assert length(funcs) == 1
+
+      assert Map.has_key?(func_ids, :main)
+    end
+
+    test "string deduplication avoids duplicate entries" do
+      b = BTF.new()
+      # add_struct calls add_str for member names
+      {_id1, b} = BTF.add_struct(b, "test", 8, [{"field1", 0, 0}])
+      {_id2, b} = BTF.add_struct(b, "test2", 8, [{"field1", 0, 0}])
+
+      # "field1" should appear only once in string table
+      str = b.str_tab
+      # Count occurrences of "field1\0"
+      count = count_string_occurrences(str, "field1")
+      assert count == 1
+    end
+  end
+
+  defp count_string_occurrences(bin, target) do
+    target_with_null = target <> <<0>>
+    do_count_string(bin, target_with_null, 0)
+  end
+
+  defp do_count_string(<<>>, _target, count), do: count
+  defp do_count_string(bin, target, count) when byte_size(bin) < byte_size(target), do: count
+  defp do_count_string(bin, target, count) do
+    target_size = byte_size(target)
+    if binary_part(bin, 0, target_size) == target do
+      <<_::binary-size(target_size), rest::binary>> = bin
+      do_count_string(rest, target, count + 1)
+    else
+      <<_::8, rest::binary>> = bin
+      do_count_string(rest, target, count)
+    end
+  end
 end

@@ -1,0 +1,27 @@
+; Cgroup SKB Port Filter
+;
+; Attached to a cgroup, inspects outgoing packets and blocks those
+; destined for a specific port. Uses a hash map of blocked ports:
+; if the destination port is found in the map, the packet is dropped.
+;
+; Returns 1 (allow) or 0 (drop).
+;
+; Exercises: SkBuff context, hash map lookup, conditional branching,
+;            multi-function programs (helper + entry point).
+
+(program :cgroup_skb)
+
+(defmap blocked_ports :hash :u32 :u32 64)
+
+(extern bpf:map_lookup_elem [:u64 :u64] :u64)
+
+(defn is_blocked [port :u32] :u32
+  (let [key (u64 port)]
+    (match (bpf/map_lookup_elem blocked_ports key)
+      [(Some ptr) 1]
+      [(None) 0])))
+
+(defn filter [skb :SkBuff] :u32
+  (if (== (is_blocked (. skb :remote_port)) 1)
+    0
+    1))

@@ -20,7 +20,7 @@ defmodule VaistoBpf.SignedArithmeticTest do
   # Helper: compile AST to binary and decode all instructions
   defp compile_and_decode(ast) do
     {:ok, ir} = Emitter.emit(ast)
-    {:ok, instructions, _relocs} = Assembler.assemble(ir)
+    {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
     binary = IO.iodata_to_binary(instructions)
     for <<chunk::binary-size(8) <- binary>>, do: Types.decode(chunk)
   end

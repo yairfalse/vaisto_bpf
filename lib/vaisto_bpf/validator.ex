@@ -124,6 +124,17 @@ defmodule VaistoBpf.Validator do
   # Variables
   defp do_validate({:var, _name, type}, ctx), do: validate_type(type, ctx)
 
+  # Global variable references
+  defp do_validate({:global_ref, _name, type}, ctx), do: validate_type(type, ctx)
+
+  # Global variable writes
+  defp do_validate({:global_set, _name, value_expr, type}, ctx) do
+    with :ok <- validate_type(type, ctx),
+         :ok <- do_validate(value_expr, ctx) do
+      :ok
+    end
+  end
+
   # Function references
   defp do_validate({:fn_ref, _name, _arity, _type}, _ctx), do: :ok
 

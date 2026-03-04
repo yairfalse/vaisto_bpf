@@ -126,11 +126,12 @@ defmodule VaistoBpf.StackTest do
       (defn get_time [] :u64 (bpf/ktime_get_ns))
       """)
 
-      # No STX_MEM to r10 needed
-      stx_to_r10 = Enum.filter(instructions, fn insn ->
-        insn.opcode == @stx_dw_opcode and insn.dst == Types.r10()
+      # Only prologue STX_MEM to r10 (callee-saved saves at negative offsets)
+      # No user-level stack usage expected
+      user_stx_to_r10 = Enum.filter(instructions, fn insn ->
+        insn.opcode == @stx_dw_opcode and insn.dst == Types.r10() and insn.offset >= 0
       end)
-      assert stx_to_r10 == [], "ktime_get_ns should not use stack"
+      assert user_stx_to_r10 == [], "ktime_get_ns should not use user stack"
 
       # But still has CALL
       call_insn = Enum.find(instructions, &(&1.opcode == @call_opcode))

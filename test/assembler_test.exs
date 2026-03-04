@@ -9,7 +9,7 @@ defmodule VaistoBpf.AssemblerTest do
   describe "instruction encoding" do
     test "mov64_imm encodes correctly" do
       ir = [{:mov_imm, 1, 42}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       assert byte_size(binary) == 8
       decoded = Types.decode(binary)
@@ -21,7 +21,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "mov64_reg encodes correctly" do
       ir = [{:mov_reg, 2, 3}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       assert decoded.dst == 2
@@ -31,7 +31,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "alu64_imm add encodes correctly" do
       ir = [{:alu64_imm, :add, 1, 10}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       assert decoded.dst == 1
@@ -42,7 +42,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "alu64_reg sub encodes correctly" do
       ir = [{:alu64_reg, :sub, 1, 2}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       assert decoded.dst == 1
@@ -53,7 +53,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "alu32_imm encodes correctly" do
       ir = [{:alu32_imm, :mul, 3, 5}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       assert decoded.dst == 3
@@ -64,7 +64,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "exit encodes correctly" do
       ir = [:exit]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       # EXIT | JMP = 0x90 | 0x05
@@ -77,7 +77,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "call helper encodes correctly" do
       ir = [{:call, 14}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       # CALL | JMP = 0x80 | 0x05
@@ -98,7 +98,7 @@ defmodule VaistoBpf.AssemblerTest do
         :exit
       ]
 
-      {:ok, instructions, _relocs} = Assembler.assemble(ir)
+      {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
       assert length(instructions) == 7
       assert Enum.all?(instructions, &(byte_size(&1) == 8))
     end
@@ -113,7 +113,7 @@ defmodule VaistoBpf.AssemblerTest do
         {:mov_imm, 1, 0}
       ]
 
-      {:ok, instructions, _relocs} = Assembler.assemble(ir)
+      {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
       # 3 instructions (labels are stripped)
       assert length(instructions) == 3
 
@@ -130,7 +130,7 @@ defmodule VaistoBpf.AssemblerTest do
         {:ja, :loop}
       ]
 
-      {:ok, instructions, _relocs} = Assembler.assemble(ir)
+      {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
       assert length(instructions) == 2
 
       # ja at index 1, target at index 0: offset = 0 - (1+1) = -2
@@ -149,7 +149,7 @@ defmodule VaistoBpf.AssemblerTest do
         :exit
       ]
 
-      {:ok, instructions, _relocs} = Assembler.assemble(ir)
+      {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
       # Labels are stripped: 5 instructions
       assert length(instructions) == 5
 
@@ -169,7 +169,7 @@ defmodule VaistoBpf.AssemblerTest do
   describe "memory access instructions" do
     test "ldx_mem u64 encodes correctly" do
       ir = [{:ldx_mem, :u64, 1, 2, 0}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       # LDX | MEM | DW = 0x01 | 0x60 | 0x18 = 0x79
@@ -181,7 +181,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "stx_mem u32 encodes correctly" do
       ir = [{:stx_mem, :u32, 3, 4, 8}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       # STX | MEM | W = 0x03 | 0x60 | 0x00 = 0x63
@@ -200,8 +200,8 @@ defmodule VaistoBpf.AssemblerTest do
       ]
 
       for {size, ldx_op, stx_op} <- sizes_and_opcodes do
-        {:ok, [ldx_bin], _} = Assembler.assemble([{:ldx_mem, size, 0, 1, 0}])
-        {:ok, [stx_bin], _} = Assembler.assemble([{:stx_mem, size, 0, 1, 0}])
+        {:ok, [ldx_bin], _, _, _} = Assembler.assemble([{:ldx_mem, size, 0, 1, 0}])
+        {:ok, [stx_bin], _, _, _} = Assembler.assemble([{:stx_mem, size, 0, 1, 0}])
 
         assert Types.decode(ldx_bin).opcode == ldx_op, "ldx #{size} expected 0x#{Integer.to_string(ldx_op, 16)}"
         assert Types.decode(stx_bin).opcode == stx_op, "stx #{size} expected 0x#{Integer.to_string(stx_op, 16)}"
@@ -210,7 +210,7 @@ defmodule VaistoBpf.AssemblerTest do
 
     test "negative offset works" do
       ir = [{:ldx_mem, :u64, 1, 10, -8}]
-      {:ok, [binary], _relocs} = Assembler.assemble(ir)
+      {:ok, [binary], _relocs, _fns, _cores} = Assembler.assemble(ir)
 
       decoded = Types.decode(binary)
       assert decoded.offset == -8
@@ -224,7 +224,7 @@ defmodule VaistoBpf.AssemblerTest do
         :exit
       ]
 
-      {:ok, instructions, _relocs} = Assembler.assemble(ir)
+      {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
       assert length(instructions) == 3
       assert Enum.all?(instructions, &(byte_size(&1) == 8))
     end

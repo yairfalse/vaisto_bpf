@@ -240,6 +240,64 @@ defmodule VaistoBpf.BpfTypeCheckerTest do
     end
   end
 
+  describe "error source locations" do
+    test "arithmetic type mismatch includes source location" do
+      ast = parse_bpf("(defn f [x :u64 y :u32] :u64 (+ x y))")
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+      assert span.line == 1
+      assert span.col > 0
+    end
+
+    test "return type mismatch includes source location" do
+      ast = parse_bpf("(defn f [x :u64 y :u64] :bool (+ x y))")
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+      assert span.line == 1
+    end
+
+    test "multi-line source points to correct line" do
+      source = """
+      (defn good [x :u64] :u64 (+ x 1))
+      (defn bad [a :u64 b :u32] :u64 (+ a b))
+      """
+      ast = parse_bpf(source)
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+      assert span.line == 2
+    end
+
+    test "if branch mismatch includes source location" do
+      ast = parse_bpf("(defn f [a :u64 b :u32 c :bool] :u64 (if c a b))")
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+      assert span.line == 1
+    end
+
+    test "unknown helper includes source location" do
+      ast = parse_bpf("(defn f [x :u64] :u64 (bpf/nonexistent x))")
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+    end
+
+    test "rejected construct (anonymous fn) includes source location" do
+      ast = parse_bpf("(defn f [x :u64] :u64 (fn [y] y))")
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+    end
+
+    test "sum type rejection includes source location" do
+      source = """
+      (deftype Shape (| Circle Square))
+      (defn f [] :u64 0)
+      """
+      ast = parse_bpf(source)
+      assert {:error, %Error{primary_span: span}} = BpfTypeChecker.check(ast)
+      assert span != nil
+      assert span.line == 1
+    end
+  end
+
   describe "deftype" do
     test "record with BPF fields passes" do
       ast = parse_bpf("""

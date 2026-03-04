@@ -12,7 +12,7 @@ defmodule VaistoBpf.SignedComparisonTest do
   # Helper: compile AST to binary and return the raw bytes
   defp compile_to_binary(ast) do
     {:ok, ir} = Emitter.emit(ast)
-    {:ok, instructions, _relocs} = Assembler.assemble(ir)
+    {:ok, instructions, _relocs, _fns, _cores} = Assembler.assemble(ir)
     IO.iodata_to_binary(instructions)
   end
 

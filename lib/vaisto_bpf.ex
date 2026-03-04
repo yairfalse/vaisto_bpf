@@ -49,7 +49,7 @@ defmodule VaistoBpf do
   def compile(typed_ast) do
     with {:ok, ast} <- Validator.validate(typed_ast),
          {:ok, ir} <- Emitter.emit(ast),
-         {:ok, instructions, _relocations} <- Assembler.assemble(ir) do
+         {:ok, instructions, _relocations, _func_offsets, _core_relos} <- Assembler.assemble(ir) do
       {:ok, instructions}
     end
   end
@@ -68,15 +68,16 @@ defmodule VaistoBpf do
   def compile_source(source) do
     {cleaned, _section, prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
+    {cleaned, globals} = Preprocessor.extract_defglobals(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
-    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type),
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type, globals),
          :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
-         {:ok, ir} <- Emitter.emit(ast, maps),
-         {:ok, instructions, _relocations} <- Assembler.assemble(ir) do
+         {:ok, ir} <- Emitter.emit(ast, maps, globals),
+         {:ok, instructions, _relocations, _func_offsets, _core_relos} <- Assembler.assemble(ir) do
       {:ok, instructions}
     end
   end
@@ -94,16 +95,19 @@ defmodule VaistoBpf do
   def compile_source_to_elf(source, opts \\ []) do
     {cleaned, section_name, prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
+    {cleaned, globals} = Preprocessor.extract_defglobals(cleaned)
     preprocessed = Preprocessor.preprocess_source(cleaned)
     parsed = Vaisto.Parser.parse(preprocessed)
     normalized = Preprocessor.normalize_ast(parsed)
 
-    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type),
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type, globals),
          :ok <- Safety.check(typed_ast),
          {:ok, ast} <- Validator.validate(typed_ast),
-         {:ok, ir} <- Emitter.emit(ast, maps),
-         {:ok, instructions, relocations} <- Assembler.assemble(ir) do
-      elf_opts = opts ++ [maps: maps, relocations: relocations]
+         {:ok, ir} <- Emitter.emit(ast, maps, globals, opts),
+         {:ok, instructions, relocations, func_offsets, core_relos} <- Assembler.assemble(ir) do
+      func_sigs = extract_function_signatures(typed_ast)
+      elf_opts = opts ++ [maps: maps, relocations: relocations, func_offsets: func_offsets,
+                          globals: globals, func_sigs: func_sigs, core_relos: core_relos]
       elf_opts = if section_name, do: Keyword.put_new(elf_opts, :section, section_name), else: elf_opts
       elf_opts = if prog_type, do: Keyword.put_new(elf_opts, :prog_type, prog_type), else: elf_opts
       ElfWriter.to_elf(instructions, elf_opts)
@@ -148,4 +152,32 @@ defmodule VaistoBpf do
   def validate(typed_ast) do
     Validator.validate(typed_ast)
   end
+
+  # Extract function signatures from the typed AST for BTF generation.
+  # Returns a list of {name, param_types, ret_type} tuples.
+  defp extract_function_signatures({:module, forms}) do
+    forms
+    |> Enum.filter(&match?({:defn, _, _, _, _}, &1))
+    |> Enum.map(fn {:defn, name, params, _body, fn_type} ->
+      param_types = extract_param_types(params, fn_type)
+      ret_type = extract_ret_type(fn_type)
+      {name, param_types, ret_type}
+    end)
+  end
+
+  defp extract_function_signatures(_), do: []
+
+  defp extract_param_types(_params, {:fn, param_types, _ret}) do
+    Enum.map(param_types, &normalize_btf_type/1)
+  end
+
+  defp extract_param_types(_params, _fn_type), do: []
+
+  defp extract_ret_type({:fn, _params, ret}), do: normalize_btf_type(ret)
+  defp extract_ret_type(_), do: :u64
+
+  defp normalize_btf_type(type) when type in [:u8, :u16, :u32, :u64, :i8, :i16, :i32, :i64], do: type
+  defp normalize_btf_type(:bool), do: :bool
+  defp normalize_btf_type(:unit), do: :unit
+  defp normalize_btf_type(_), do: :u64
 end

@@ -37,7 +37,13 @@
 #include <errno.h>
 #include <net/if.h>
 #include <linux/if_link.h>
+#include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <linux/if_ether.h>
+#include <linux/perf_event.h>
+#include <linux/pkt_cls.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -75,6 +81,14 @@
 #define PROG_TYPE_CGROUP_SKB    8
 #define PROG_TYPE_UPROBE        9
 #define PROG_TYPE_URETPROBE     10
+#define PROG_TYPE_PERF_EVENT       11
+#define PROG_TYPE_LSM              12
+#define PROG_TYPE_SK_MSG           13
+#define PROG_TYPE_SK_SKB           14
+#define PROG_TYPE_CGROUP_SOCK      15
+#define PROG_TYPE_CGROUP_SOCK_ADDR 16
+#define PROG_TYPE_FLOW_DISSECTOR   17
+#define PROG_TYPE_STRUCT_OPS       18
 
 struct loaded_obj {
     struct bpf_object *obj;
@@ -82,6 +96,10 @@ struct loaded_obj {
     unsigned int ifindex;     /* XDP/TC only */
     uint32_t xdp_flags;      /* XDP only */
     uint8_t prog_type;        /* which type was loaded */
+    int cgroup_fd;            /* cgroup_skb/cgroup_sock/cgroup_sock_addr */
+    int socket_fd;            /* socket_filter */
+    int pe_fd;                /* perf_event fd */
+    struct bpf_tc_hook *tc_hook;  /* TC only */
 };
 
 struct rb_sub {
@@ -414,6 +432,10 @@ static void handle_load(const uint8_t *data, uint16_t len) {
     loaded[slot].ifindex = 0;
     loaded[slot].xdp_flags = 0;
     loaded[slot].prog_type = prog_type;
+    loaded[slot].cgroup_fd = -1;
+    loaded[slot].socket_fd = -1;
+    loaded[slot].pe_fd = -1;
+    loaded[slot].tc_hook = NULL;
 
     /* Attach based on program type */
     switch (prog_type) {
@@ -501,6 +523,125 @@ static void handle_load(const uint8_t *data, uint16_t len) {
         loaded[slot].link = link;
         break;
     }
+    case PROG_TYPE_TC: {
+        /* target = interface name; attach as TC ingress classifier */
+        unsigned int tc_ifindex = if_nametoindex(target);
+        if (tc_ifindex == 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: unknown interface '%s'", target);
+            send_error(errbuf);
+            return;
+        }
+        int prog_fd = bpf_program__fd(prog);
+        if (prog_fd < 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: invalid program fd");
+            return;
+        }
+
+        LIBBPF_OPTS(bpf_tc_hook, hook,
+            .ifindex = tc_ifindex,
+            .attach_point = BPF_TC_INGRESS,
+        );
+        /* Create clsact qdisc — EEXIST is fine (already exists) */
+        int err = bpf_tc_hook_create(&hook);
+        if (err && err != -EEXIST) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: bpf_tc_hook_create failed: %s",
+                     strerror(-err));
+            send_error(errbuf);
+            return;
+        }
+
+        LIBBPF_OPTS(bpf_tc_opts, tc_opts,
+            .prog_fd = prog_fd,
+        );
+        err = bpf_tc_hook_attach(&hook, &tc_opts);
+        if (err) {
+            bpf_tc_hook_destroy(&hook);
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: bpf_tc_hook_attach failed: %s",
+                     strerror(-err));
+            send_error(errbuf);
+            return;
+        }
+
+        /* Save hook for cleanup — heap-allocate since LIBBPF_OPTS is stack-local */
+        struct bpf_tc_hook *saved_hook = malloc(sizeof(struct bpf_tc_hook));
+        if (!saved_hook) {
+            /* Treat allocation failure as load failure */
+            bpf_tc_hook_detach(&hook, &tc_opts);
+            bpf_tc_hook_destroy(&hook);
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: failed to allocate memory for tc_hook state");
+            return;
+        }
+        memcpy(saved_hook, &hook, sizeof(struct bpf_tc_hook));
+        loaded[slot].tc_hook = saved_hook;
+        loaded[slot].ifindex = tc_ifindex;
+        break;
+    }
+    case PROG_TYPE_SOCKET_FILTER: {
+        /* Create a raw socket and attach the BPF program via SO_ATTACH_BPF */
+        int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        if (sock < 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: socket() failed: %s", strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        int prog_fd = bpf_program__fd(prog);
+        if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_BPF, &prog_fd, sizeof(prog_fd)) < 0) {
+            close(sock);
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: SO_ATTACH_BPF failed: %s", strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].socket_fd = sock;
+        break;
+    }
+    case PROG_TYPE_CGROUP_SKB:
+    case PROG_TYPE_CGROUP_SOCK:
+    case PROG_TYPE_CGROUP_SOCK_ADDR: {
+        /* target = cgroup path (e.g. "/sys/fs/cgroup/unified") */
+        int cg_fd = open(target, O_RDONLY);
+        if (cg_fd < 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: open cgroup '%s' failed: %s",
+                     target, strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        struct bpf_link *link = bpf_program__attach_cgroup(prog, cg_fd);
+        if (!link) {
+            close(cg_fd);
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_cgroup '%s' failed: %s",
+                     target, strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        loaded[slot].cgroup_fd = cg_fd;
+        break;
+    }
     case PROG_TYPE_UPROBE:
     case PROG_TYPE_URETPROBE: {
         /* target format: "pid:binary_path:func_offset" */
@@ -542,13 +683,94 @@ static void handle_load(const uint8_t *data, uint16_t len) {
         loaded[slot].link = link;
         break;
     }
-    case PROG_TYPE_TC:
-    case PROG_TYPE_SOCKET_FILTER:
-    case PROG_TYPE_CGROUP_SKB: {
+    case PROG_TYPE_PERF_EVENT: {
+        /* target format: "type:config" (e.g. "1:1" for PERF_TYPE_SOFTWARE:PERF_COUNT_SW_CPU_CLOCK) */
+        char *colon = strchr(target, ':');
+        if (!colon) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            send_error("load: perf_event target must be 'type:config'");
+            return;
+        }
+        *colon = '\0';
+        uint32_t pe_type = (uint32_t)strtoul(target, NULL, 0);
+        uint64_t pe_config = (uint64_t)strtoull(colon + 1, NULL, 0);
+
+        struct perf_event_attr attr = {};
+        attr.type = pe_type;
+        attr.size = sizeof(attr);
+        attr.config = pe_config;
+        attr.sample_period = 1;
+
+        /* Open perf event on cpu 0, pid=-1 for system-wide */
+        int pe_fd = syscall(__NR_perf_event_open, &attr, -1 /* pid */, 0 /* cpu */, -1, 0);
+        if (pe_fd < 0) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: perf_event_open failed: %s", strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+
+        struct bpf_link *link = bpf_program__attach_perf_event(prog, pe_fd);
+        if (!link) {
+            close(pe_fd);
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_perf_event failed: %s", strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        loaded[slot].pe_fd = pe_fd;
+        break;
+    }
+    case PROG_TYPE_LSM: {
+        /* LSM programs get their attach point from the ELF section name */
+        struct bpf_link *link = bpf_program__attach_lsm(prog);
+        if (!link) {
+            bpf_object__close(obj);
+            loaded[slot].obj = NULL;
+            char errbuf[128];
+            snprintf(errbuf, sizeof(errbuf), "load: attach_lsm failed: %s", strerror(errno));
+            send_error(errbuf);
+            return;
+        }
+        loaded[slot].link = link;
+        break;
+    }
+    case PROG_TYPE_STRUCT_OPS: {
+        /* struct_ops programs auto-register from the ELF section */
+        struct bpf_map *map;
+        bpf_object__for_each_map(map, obj) {
+            if (bpf_map__type(map) == BPF_MAP_TYPE_STRUCT_OPS) {
+                struct bpf_link *link = bpf_map__attach_struct_ops(map);
+                if (!link) {
+                    bpf_object__close(obj);
+                    loaded[slot].obj = NULL;
+                    char errbuf[128];
+                    snprintf(errbuf, sizeof(errbuf), "load: attach_struct_ops failed: %s",
+                             strerror(errno));
+                    send_error(errbuf);
+                    return;
+                }
+                loaded[slot].link = link;
+                break;
+            }
+        }
+        break;
+    }
+    case PROG_TYPE_SK_MSG:
+    case PROG_TYPE_SK_SKB:
+    case PROG_TYPE_FLOW_DISSECTOR: {
         bpf_object__close(obj);
         loaded[slot].obj = NULL;
         char errbuf[128];
-        snprintf(errbuf, sizeof(errbuf), "load: prog_type %d not yet supported", prog_type);
+        snprintf(errbuf, sizeof(errbuf),
+                 "load: prog_type %d requires sockmap/flow_dissector attach (not yet supported)",
+                 prog_type);
         send_error(errbuf);
         return;
     }
@@ -579,9 +801,26 @@ static void handle_detach(const uint8_t *data, uint16_t len) {
         bpf_link__destroy(loaded[handle].link);
         loaded[handle].link = NULL;
     }
-    if (loaded[handle].ifindex) {
+    if (loaded[handle].tc_hook) {
+        bpf_tc_hook_destroy(loaded[handle].tc_hook);
+        free(loaded[handle].tc_hook);
+        loaded[handle].tc_hook = NULL;
+    }
+    if (loaded[handle].ifindex && loaded[handle].prog_type == PROG_TYPE_XDP) {
         bpf_xdp_detach(loaded[handle].ifindex, loaded[handle].xdp_flags, NULL);
-        loaded[handle].ifindex = 0;
+    }
+    loaded[handle].ifindex = 0;
+    if (loaded[handle].cgroup_fd >= 0) {
+        close(loaded[handle].cgroup_fd);
+        loaded[handle].cgroup_fd = -1;
+    }
+    if (loaded[handle].socket_fd >= 0) {
+        close(loaded[handle].socket_fd);
+        loaded[handle].socket_fd = -1;
+    }
+    if (loaded[handle].pe_fd >= 0) {
+        close(loaded[handle].pe_fd);
+        loaded[handle].pe_fd = -1;
     }
     bpf_object__close(loaded[handle].obj);
     loaded[handle].obj = NULL;
@@ -984,9 +1223,26 @@ static void cleanup_all(void) {
                 bpf_link__destroy(loaded[i].link);
                 loaded[i].link = NULL;
             }
-            if (loaded[i].ifindex) {
+            if (loaded[i].tc_hook) {
+                bpf_tc_hook_destroy(loaded[i].tc_hook);
+                free(loaded[i].tc_hook);
+                loaded[i].tc_hook = NULL;
+            }
+            if (loaded[i].ifindex && loaded[i].prog_type == PROG_TYPE_XDP) {
                 bpf_xdp_detach(loaded[i].ifindex, loaded[i].xdp_flags, NULL);
-                loaded[i].ifindex = 0;
+            }
+            loaded[i].ifindex = 0;
+            if (loaded[i].cgroup_fd >= 0) {
+                close(loaded[i].cgroup_fd);
+                loaded[i].cgroup_fd = -1;
+            }
+            if (loaded[i].socket_fd >= 0) {
+                close(loaded[i].socket_fd);
+                loaded[i].socket_fd = -1;
+            }
+            if (loaded[i].pe_fd >= 0) {
+                close(loaded[i].pe_fd);
+                loaded[i].pe_fd = -1;
             }
             bpf_object__close(loaded[i].obj);
             loaded[i].obj = NULL;
