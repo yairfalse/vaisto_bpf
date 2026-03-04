@@ -1,0 +1,23 @@
+; XDP Packet Counter
+;
+; Counts packets per RX queue using a BPF array map.
+; Each queue index maps to a u64 counter that increments on every packet.
+; Returns XDP_PASS (2) to let all packets through.
+;
+; Exercises: context field access, type casts, map lookup/update,
+;            nullable pointer matching (Some/None), memory load/store.
+
+(program :xdp)
+
+(defmap pkt_count :array :u32 :u64 64)
+
+(extern bpf:map_lookup_elem [:u64 :u64] :u64)
+
+(defn handler [ctx :XdpMd] :u32
+  (let [key (u64 (. ctx :rx_queue_index))]
+    (match (bpf/map_lookup_elem pkt_count key)
+      [(Some ptr)
+       (do (bpf/store_u64 ptr 0 (+ (bpf/load_u64 ptr 0) 1))
+           2)]
+      [(None)
+       2])))

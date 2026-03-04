@@ -1,0 +1,29 @@
+; Kprobe Syscall Tracer
+;
+; Attaches to sys_execve and emits an event to a ring buffer
+; containing the PID/TGID and a nanosecond timestamp.
+;
+; Event layout (16 bytes):
+;   offset 0: pid_tgid (u64) — high 32 = PID, low 32 = TGID
+;   offset 8: timestamp (u64) — ktime_get_ns
+;
+; Exercises: ring buffer reserve/submit, helper calls, nullable
+;            pointer matching, sequential side effects with (do ...).
+
+(program :kprobe "sys_execve")
+
+(defmap events :ringbuf 0 0 4096)
+
+(extern bpf:ringbuf_reserve [:u64 :u64 :u64] :u64)
+(extern bpf:ringbuf_submit [:u64 :u64] :u64)
+(extern bpf:get_current_pid_tgid [] :u64)
+(extern bpf:ktime_get_ns [] :u64)
+
+(defn handler [ctx :PtRegs] :u64
+  (match (bpf/ringbuf_reserve events 16 0)
+    [(Some ptr)
+     (do (bpf/store_u64 ptr 0 (bpf/get_current_pid_tgid))
+         (bpf/store_u64 ptr 8 (bpf/ktime_get_ns))
+         (bpf/ringbuf_submit ptr 0)
+         0)]
+    [(None) 0]))
