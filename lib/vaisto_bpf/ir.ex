@@ -28,6 +28,8 @@ defmodule VaistoBpf.IR do
           | {:stx_mem, atom(), register(), register(), integer()}
           | {:call_fn, label()}
           | {:endian, atom(), non_neg_integer(), register()}
+          | {:ld_global, register(), atom(), non_neg_integer()}
+          | {:core_relo, atom(), atom(), non_neg_integer()}
           | :exit
 
   @type program :: [instruction()]

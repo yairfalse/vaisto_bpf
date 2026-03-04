@@ -30,8 +30,8 @@ defmodule VaistoBpf.Emitter do
   Returns `{:ok, instructions}` where instructions is a list of IR nodes.
   """
   @spec emit(term(), [VaistoBpf.MapDef.t()]) :: {:ok, [VaistoBpf.IR.node()]} | {:error, Vaisto.Error.t()}
-  def emit(ast, maps \\ []) do
-    ctx = new_context(maps)
+  def emit(ast, maps \\ [], globals \\ [], opts \\ []) do
+    ctx = new_context(maps, globals, opts)
 
     try do
       {_reg, ctx} = emit_node(ast, ctx)
@@ -45,17 +45,20 @@ defmodule VaistoBpf.Emitter do
   # Context Management
   # ============================================================================
 
-  defp new_context(maps) do
+  defp new_context(maps, globals, opts) do
     map_lookup = Map.new(maps, fn md -> {md.name, md.index} end)
+    global_lookup = Map.new(globals, fn gd -> {gd.name, gd} end)
     %{
       free_regs: Enum.to_list(Types.r1()..Types.r9()),
       next_label: 0,
       vars: %{},
       instructions: [],
       maps: map_lookup,
+      globals: global_lookup,
       stack_offset: 0,
       record_defs: Map.new(VaistoBpf.ContextTypes.all()),
-      user_fns: MapSet.new()
+      user_fns: MapSet.new(),
+      core: Keyword.get(opts, :core, false)
     }
   end
 
@@ -132,8 +135,23 @@ defmodule VaistoBpf.Emitter do
   # ============================================================================
 
   defp emit_node({:defn, name, params, body, _fn_type}, ctx) do
+    # Save parent function's state for stack isolation
+    saved_stack_offset = ctx.stack_offset
+    saved_vars = ctx.vars
+
     # Emit function label
     ctx = push(ctx, {:label, {:fn, name}})
+
+    # Reset per-function state: clean stack frame and register file
+    ctx = %{ctx | stack_offset: 0, vars: %{}, free_regs: Enum.to_list(Types.r1()..Types.r9())}
+
+    # Callee-saved register prologue: save r6-r9 to stack
+    # This consumes the first 32 bytes of the 512-byte stack frame
+    ctx = push(ctx, {:stx_mem, :u64, Types.r10(), Types.r6(), -8})
+    ctx = push(ctx, {:stx_mem, :u64, Types.r10(), Types.r7(), -16})
+    ctx = push(ctx, {:stx_mem, :u64, Types.r10(), Types.r8(), -24})
+    ctx = push(ctx, {:stx_mem, :u64, Types.r10(), Types.r9(), -32})
+    ctx = %{ctx | stack_offset: -32}
 
     # Bind parameters to registers r1..rN (BPF calling convention)
     param_count = length(params)
@@ -161,7 +179,18 @@ defmodule VaistoBpf.Emitter do
         ctx
       end
 
+    # Callee-saved register epilogue: restore r6-r9 from stack
+    ctx = push(ctx, {:ldx_mem, :u64, Types.r6(), Types.r10(), -8})
+    ctx = push(ctx, {:ldx_mem, :u64, Types.r7(), Types.r10(), -16})
+    ctx = push(ctx, {:ldx_mem, :u64, Types.r8(), Types.r10(), -24})
+    ctx = push(ctx, {:ldx_mem, :u64, Types.r9(), Types.r10(), -32})
+
     ctx = push(ctx, :exit)
+
+    # Restore parent function's state (for multi-function modules)
+    ctx = %{ctx | stack_offset: saved_stack_offset, vars: saved_vars,
+                  free_regs: Enum.to_list(Types.r1()..Types.r9())}
+
     {Types.r0(), ctx}
   end
 
@@ -225,6 +254,41 @@ defmodule VaistoBpf.Emitter do
           :error -> raise "unbound variable: #{name}"
         end
     end
+  end
+
+  # Global variable read: LD_IMM64 (address) + LDX_MEM (dereference)
+  defp emit_node({:global_ref, name, type}, ctx) do
+    gdef = Map.fetch!(ctx.globals, name)
+    size = type_to_mem_size(type)
+
+    # Load global address via LD_IMM64 with relocation
+    {addr_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:ld_global, addr_reg, gdef.section, gdef.index})
+
+    # Dereference: load value from the global's offset within the section
+    {val_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:ldx_mem, size, val_reg, addr_reg, gdef.offset})
+    ctx = free_reg(ctx, addr_reg)
+    {val_reg, ctx}
+  end
+
+  # Global variable write: LD_IMM64 (address) + STX_MEM (store)
+  defp emit_node({:global_set, name, value_expr, type}, ctx) do
+    gdef = Map.fetch!(ctx.globals, name)
+    size = type_to_mem_size(type)
+
+    # Emit value expression
+    {val_reg, ctx} = emit_node(value_expr, ctx)
+
+    # Load global address
+    {addr_reg, ctx} = alloc_reg(ctx)
+    ctx = push(ctx, {:ld_global, addr_reg, gdef.section, gdef.index})
+
+    # Store value to global
+    ctx = push(ctx, {:stx_mem, size, addr_reg, val_reg, gdef.offset})
+    ctx = free_reg(ctx, addr_reg)
+    ctx = free_reg(ctx, val_reg)
+    {Types.r0(), ctx}  # set! returns :unit
   end
 
   defp emit_node({:fn_ref, _name, _arity, _type}, ctx) do
@@ -516,6 +580,7 @@ defmodule VaistoBpf.Emitter do
   end
 
   # Field access on record: emit LDX_MEM at computed offset
+  # When CO-RE is enabled, also emit a {:core_relo, ...} pseudo-instruction
   defp emit_node({:field_access, expr, field, field_type, record_name}, ctx) do
     {ptr_reg, ctx} = emit_node(expr, ctx)
 
@@ -529,11 +594,20 @@ defmodule VaistoBpf.Emitter do
     end
 
     offset = field_layout.offset
+    field_index = Enum.find_index(layout.fields, fn fl -> fl.name == field end)
     size = type_to_mem_size(field_type)
 
     ctx = maybe_free_reg(ctx, ptr_reg)
     {dst, ctx} = alloc_reg(ctx)
     ctx = push(ctx, {:ldx_mem, size, dst, ptr_reg, offset})
+
+    # CO-RE: annotate with relocation mark for libbpf to patch at load time
+    ctx = if ctx.core do
+      push(ctx, {:core_relo, record_name, field, field_index})
+    else
+      ctx
+    end
+
     {dst, ctx}
   end
 
