@@ -30,6 +30,13 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   @rejected_beam_types [:int, :float, :num, :string, :any]
 
+  # Build an Error with source location from a parser Loc.
+  defp error_with_loc(message, loc, opts \\ []) do
+    span = if loc, do: %{line: loc.line, col: loc.col, length: loc.length || 1}, else: nil
+    file = if loc, do: loc.file, else: nil
+    Error.new(message, [{:span, span}, {:file, file} | opts])
+  end
+
   @doc """
   Type-check a normalized parsed AST for BPF compilation.
 
@@ -41,10 +48,16 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   Returns `{:ok, type, typed_ast}` or `{:error, %Vaisto.Error{}}`.
   """
-  @spec check(term(), [VaistoBpf.MapDef.t()], atom() | nil) :: {:ok, term(), term()} | {:error, Error.t()}
-  def check(ast, maps \\ [], prog_type \\ nil) do
+  @spec check(term(), [VaistoBpf.MapDef.t()], atom() | nil, [VaistoBpf.GlobalDef.t()]) ::
+          {:ok, term(), term()} | {:error, Error.t()}
+  def check(ast, maps \\ [], prog_type \\ nil, globals \\ []) do
     env = Enum.reduce(maps, %{}, fn md, env ->
       Map.put(env, md.name, :u64)
+    end)
+    # Inject globals into environment with their types
+    env = Enum.reduce(globals, env, fn gdef, env ->
+      type_tag = if gdef.const?, do: {:const_global, gdef.type}, else: {:global, gdef.type}
+      Map.put(env, gdef.name, type_tag)
     end)
     env = inject_memory_builtins(env)
     env = inject_builtin_context_types(env)
@@ -52,6 +65,9 @@ defmodule VaistoBpf.BpfTypeChecker do
     map_defs_lookup = Map.new(maps, fn md -> {md.name, md} end)
     env = Map.put(env, :__map_defs__, map_defs_lookup)
     env = Map.put(env, :__prog_type__, prog_type)
+    # Store global definitions for access
+    global_defs_lookup = Map.new(globals, fn gd -> {gd.name, gd} end)
+    env = Map.put(env, :__global_defs__, global_defs_lookup)
     check_toplevel(ast, env)
   end
 
@@ -198,13 +214,13 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   # extern with separate arg_types and ret_type (6-element from preprocessor).
   # If the helper is known in the registry, override the return type (e.g., {:ptr, T}).
-  defp check_form({:extern, mod, name, arg_types, ret_type, _loc}, env) do
+  defp check_form({:extern, mod, name, arg_types, ret_type, loc}, env) do
     actual_ret = case VaistoBpf.Helpers.helper_type(name) do
       {:ok, {:fn, _, registry_ret}} -> registry_ret
       _ -> ret_type
     end
-    with :ok <- validate_bpf_type(actual_ret),
-         :ok <- validate_type_list(arg_types) do
+    with :ok <- validate_bpf_type(actual_ret, loc),
+         :ok <- validate_type_list(arg_types, loc) do
       fn_type = {:fn, arg_types, actual_ret}
       # Store both as bare name and as qualified key for lookup in calls
       env = env
@@ -215,8 +231,8 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # extern (5-element fallback)
-  defp check_form({:extern, mod, name, type_expr, _loc}, env) do
-    with :ok <- validate_bpf_type(type_expr) do
+  defp check_form({:extern, mod, name, type_expr, loc}, env) do
+    with :ok <- validate_bpf_type(type_expr, loc) do
       fn_type = normalize_extern_type(type_expr)
       env = Map.put(env, name, fn_type)
       {:ok, fn_type, {:extern, mod, name, fn_type}, env}
@@ -224,8 +240,8 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # deftype (product) — validate field types
-  defp check_form({:deftype, name, {:product, fields}, _loc}, env) do
-    with :ok <- validate_fields(fields) do
+  defp check_form({:deftype, name, {:product, fields}, loc}, env) do
+    with :ok <- validate_fields(fields, loc) do
       record_type = {:record, name, fields}
       env = Map.put(env, name, record_type)
       {:ok, record_type, {:deftype, name, {:product, fields}, record_type}, env}
@@ -233,16 +249,16 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # deftype (sum) — reject for BPF
-  defp check_form({:deftype, _name, {:sum, _}, _loc}, _env) do
-    {:error, Error.new("sum types are not supported in BPF modules",
+  defp check_form({:deftype, _name, {:sum, _}, loc}, _env) do
+    {:error, error_with_loc("sum types are not supported in BPF modules", loc,
       hint: "eBPF only supports record (product) types"
     )}
   end
 
   # defn — the core: check body against declared return type
-  defp check_form({:defn, name, params, body, ret_type, _loc}, env) do
-    with :ok <- validate_bpf_type(ret_type),
-         :ok <- validate_param_types(params) do
+  defp check_form({:defn, name, params, body, ret_type, loc}, env) do
+    with :ok <- validate_bpf_type(ret_type, loc),
+         :ok <- validate_param_types(params, loc) do
       # Promote record-typed params to {:ptr, RecordName} after validation
       params = promote_record_params(params, env)
       param_types = Enum.map(params, fn {_n, t} -> t end)
@@ -257,7 +273,7 @@ defmodule VaistoBpf.BpfTypeChecker do
       case check_expr(body, body_env, ret_type) do
         {:ok, body_type, typed_body} ->
           if types_compatible?(ret_type, body_type) do
-            case validate_context_params(params, env) do
+            case validate_context_params(params, env, loc) do
               :ok ->
                 typed_params = Enum.map(params, fn {n, _t} -> n end)
                 {:ok, fn_type, {:defn, name, typed_params, typed_body, fn_type}, Map.put(env, name, fn_type)}
@@ -266,7 +282,7 @@ defmodule VaistoBpf.BpfTypeChecker do
                 err
             end
           else
-            {:error, Error.new("return type mismatch in `#{name}`",
+            {:error, error_with_loc("return type mismatch in `#{name}`", loc,
               expected: ret_type,
               actual: body_type,
               hint: "declared return type is #{format_type(ret_type)} but body has type #{format_type(body_type)}"
@@ -309,25 +325,27 @@ defmodule VaistoBpf.BpfTypeChecker do
   # Variable lookup
   defp check_expr(name, env, _expected) when is_atom(name) do
     case Map.fetch(env, name) do
+      {:ok, {:global, type}} -> {:ok, type, {:global_ref, name, type}}
+      {:ok, {:const_global, type}} -> {:ok, type, {:global_ref, name, type}}
       {:ok, type} -> {:ok, type, {:var, name, type}}
       :error -> {:error, Error.new("unbound variable `#{name}`")}
     end
   end
 
   # Arithmetic: (+ x y), (- x y), etc.
-  defp check_expr({:call, op, [left, right], _loc}, env, expected)
+  defp check_expr({:call, op, [left, right], loc}, env, expected)
        when op in @arithmetic_ops do
-    check_binary_arith(op, left, right, env, expected)
+    check_binary_arith(op, left, right, env, expected, loc)
   end
 
   # Unary negation: (- x)
-  defp check_expr({:call, :-, [operand], _loc}, env, expected) do
+  defp check_expr({:call, :-, [operand], loc}, env, expected) do
     case check_expr(operand, env, expected) do
       {:ok, type, typed_operand} when type in @bpf_int_types ->
         {:ok, type, {:call, :-, [typed_operand], type}}
 
       {:ok, type, _} ->
-        {:error, Error.new("negation requires an integer type, got #{format_type(type)}")}
+        {:error, error_with_loc("negation requires an integer type, got #{format_type(type)}", loc)}
 
       err ->
         err
@@ -335,25 +353,25 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # Bitwise: (band x y), (bor x y), etc.
-  defp check_expr({:call, op, [left, right], _loc}, env, expected)
+  defp check_expr({:call, op, [left, right], loc}, env, expected)
        when op in @bitwise_ops do
-    check_binary_arith(op, left, right, env, expected)
+    check_binary_arith(op, left, right, env, expected, loc)
   end
 
   # Comparison: (== x y), (> x y), etc.
-  defp check_expr({:call, op, [left, right], _loc}, env, _expected)
+  defp check_expr({:call, op, [left, right], loc}, env, _expected)
        when op in @comparison_ops do
-    check_comparison(op, left, right, env)
+    check_comparison(op, left, right, env, loc)
   end
 
   # Boolean not
-  defp check_expr({:call, :not, [operand], _loc}, env, _expected) do
+  defp check_expr({:call, :not, [operand], loc}, env, _expected) do
     case check_expr(operand, env, :bool) do
       {:ok, :bool, typed_operand} ->
         {:ok, :bool, {:call, :not, [typed_operand], :bool}}
 
       {:ok, type, _} ->
-        {:error, Error.new("`not` requires a boolean, got #{format_type(type)}")}
+        {:error, error_with_loc("`not` requires a boolean, got #{format_type(type)}", loc)}
 
       err ->
         err
@@ -361,16 +379,14 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # Qualified call (e.g., bpf/ktime_get_ns)
-  defp check_expr({:call, {:qualified, mod, name} = qname, args, _loc}, env, _expected) do
+  defp check_expr({:call, {:qualified, mod, name} = qname, args, loc}, env, _expected) do
     case Map.fetch(env, {:qualified, mod, name}) do
       {:ok, {:fn, param_types, ret_type}} ->
         if length(args) != length(param_types) do
-          {:error, Error.new("helper `#{mod}/#{name}` expects #{length(param_types)} arguments, got #{length(args)}")}
+          {:error, error_with_loc("helper `#{mod}/#{name}` expects #{length(param_types)} arguments, got #{length(args)}", loc)}
         else
           case check_call_args(qname, args, param_types, ret_type, env) do
             {:ok, ret_type, {:call, _qname, typed_args, ret_type}} ->
-              # Refine return type for map_lookup_elem: if first arg is a known map
-              # with a record value_type, return {:ptr, RecordName} instead of {:ptr, :u64}
               refined_ret = maybe_refine_map_lookup_ret(name, args, ret_type, env)
               {:ok, refined_ret, {:call, {:qualified, mod, name}, typed_args, refined_ret}}
             err -> err
@@ -378,19 +394,47 @@ defmodule VaistoBpf.BpfTypeChecker do
         end
 
       {:ok, _} ->
-        {:error, Error.new("`#{mod}/#{name}` is not a function")}
+        {:error, error_with_loc("`#{mod}/#{name}` is not a function", loc)}
 
       :error ->
-        {:error, Error.new("unknown helper `#{mod}/#{name}`",
+        {:error, error_with_loc("unknown helper `#{mod}/#{name}`", loc,
           hint: "declare it with (extern #{mod}:#{name} [arg-types] :ret-type)"
         )}
+    end
+  end
+
+  # Global variable set!: (set! name value) → :unit
+  defp check_expr({:call, :set!, [target, value], loc}, env, _expected) when is_atom(target) do
+    case Map.fetch(env, target) do
+      {:ok, {:const_global, _type}} ->
+        {:error, error_with_loc("cannot assign to defconst '#{target}'", loc)}
+
+      {:ok, {:global, type}} ->
+        case check_expr(value, env, type) do
+          {:ok, val_type, typed_value} when val_type == type ->
+            {:ok, :unit, {:global_set, target, typed_value, type}}
+
+          {:ok, val_type, _} ->
+            {:error, error_with_loc(
+              "set! type mismatch: global '#{target}' is #{format_type(type)} but value is #{format_type(val_type)}",
+              loc
+            )}
+
+          err -> err
+        end
+
+      {:ok, _} ->
+        {:error, error_with_loc("set! can only be used on defglobal variables", loc)}
+
+      :error ->
+        {:error, error_with_loc("unbound variable `#{target}`", loc)}
     end
   end
 
   # Type cast: (u64 expr), (u32 expr), etc. — widening/narrowing between BPF integer types
   @cast_types MapSet.new(@bpf_int_types)
 
-  defp check_expr({:call, cast_name, [inner], _loc}, env, _expected)
+  defp check_expr({:call, cast_name, [inner], loc}, env, _expected)
        when is_atom(cast_name) do
     if MapSet.member?(@cast_types, cast_name) do
       case check_expr(inner, env, nil) do
@@ -398,36 +442,36 @@ defmodule VaistoBpf.BpfTypeChecker do
           {:ok, cast_name, {:cast, cast_name, typed_inner, src_type}}
 
         {:ok, src_type, _} ->
-          {:error, Error.new("type cast requires an integer type, got #{format_type(src_type)}")}
+          {:error, error_with_loc("type cast requires an integer type, got #{format_type(src_type)}", loc)}
 
         err ->
           err
       end
     else
-      check_named_call(cast_name, [inner], env)
+      check_named_call(cast_name, [inner], env, loc)
     end
   end
 
   # Function call (named)
-  defp check_expr({:call, name, args, _loc}, env, _expected) when is_atom(name) do
-    check_named_call(name, args, env)
+  defp check_expr({:call, name, args, loc}, env, _expected) when is_atom(name) do
+    check_named_call(name, args, env, loc)
   end
 
   # if expression
-  defp check_expr({:if, cond_expr, then_expr, else_expr, _loc}, env, expected) do
+  defp check_expr({:if, cond_expr, then_expr, else_expr, loc}, env, expected) do
     with {:ok, :bool, typed_cond} <- check_expr(cond_expr, env, :bool),
          {:ok, then_type, typed_then} <- check_expr(then_expr, env, expected),
          {:ok, else_type, typed_else} <- check_expr(else_expr, env, expected) do
       cond do
         not is_bool_type?({:ok, :bool, typed_cond}, cond_expr) ->
-          {:error, Error.new("if condition must be boolean")}
+          {:error, error_with_loc("if condition must be boolean", loc)}
 
         types_compatible?(then_type, else_type) ->
           result_type = pick_concrete(then_type, else_type)
           {:ok, result_type, {:if, typed_cond, typed_then, typed_else, result_type}}
 
         true ->
-          {:error, Error.new("if branches have different types",
+          {:error, error_with_loc("if branches have different types", loc,
             expected: then_type,
             actual: else_type,
             hint: "then branch is #{format_type(then_type)}, else branch is #{format_type(else_type)}"
@@ -435,7 +479,7 @@ defmodule VaistoBpf.BpfTypeChecker do
       end
     else
       {:ok, cond_type, _} ->
-        {:error, Error.new("if condition must be boolean, got #{format_type(cond_type)}")}
+        {:error, error_with_loc("if condition must be boolean, got #{format_type(cond_type)}", loc)}
 
       {:error, _} = err ->
         err
@@ -453,7 +497,7 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # for-range loop: (for-range i start end body) → :unit
-  defp check_expr({:for_range, var, start_expr, end_expr, body, _loc}, env, _expected)
+  defp check_expr({:for_range, var, start_expr, end_expr, body, loc}, env, _expected)
        when is_atom(var) do
     # Pre-check: determine type context from whichever side has a known type
     start_pre = pre_check_type(start_expr, env)
@@ -464,13 +508,13 @@ defmodule VaistoBpf.BpfTypeChecker do
          {:ok, end_type, typed_end} <- check_expr(end_expr, env, start_type) do
       cond do
         start_type not in @bpf_int_types ->
-          {:error, Error.new("for-range start must be an integer type, got #{format_type(start_type)}")}
+          {:error, error_with_loc("for-range start must be an integer type, got #{format_type(start_type)}", loc)}
 
         end_type not in @bpf_int_types ->
-          {:error, Error.new("for-range end must be an integer type, got #{format_type(end_type)}")}
+          {:error, error_with_loc("for-range end must be an integer type, got #{format_type(end_type)}", loc)}
 
         start_type != end_type ->
-          {:error, Error.new("for-range start and end must be the same type",
+          {:error, error_with_loc("for-range start and end must be the same type", loc,
             expected: start_type, actual: end_type)}
 
         true ->
@@ -491,30 +535,30 @@ defmodule VaistoBpf.BpfTypeChecker do
   end
 
   # Field access: (. expr :field) — resolve record type and find field
-  defp check_expr({:field_access, expr, field, _loc}, env, _expected) do
+  defp check_expr({:field_access, expr, field, loc}, env, _expected) do
     case check_expr(expr, env, nil) do
       {:ok, {:ptr, record_name}, typed_expr} when is_atom(record_name) ->
-        resolve_field_access(record_name, field, typed_expr, env)
+        resolve_field_access(record_name, field, typed_expr, env, loc)
 
       {:ok, {:record, record_name, _fields} = _rec_type, typed_expr} ->
-        resolve_field_access(record_name, field, typed_expr, env)
+        resolve_field_access(record_name, field, typed_expr, env, loc)
 
       {:ok, other_type, _typed_expr} ->
-        {:error, Error.new("field access requires a record or pointer-to-record type, got #{format_type(other_type)}")}
+        {:error, error_with_loc("field access requires a record or pointer-to-record type, got #{format_type(other_type)}", loc)}
 
       err -> err
     end
   end
 
   # Rejected constructs
-  defp check_expr({:fn, _params, _body, _loc}, _env, _expected) do
-    {:error, Error.new("anonymous functions are not supported in BPF modules",
+  defp check_expr({:fn, _params, _body, loc}, _env, _expected) do
+    {:error, error_with_loc("anonymous functions are not supported in BPF modules", loc,
       hint: "eBPF does not support closures — use named functions"
     )}
   end
 
-  defp check_expr({:cons, _h, _t, _loc}, _env, _expected) do
-    {:error, Error.new("lists are not supported in BPF modules",
+  defp check_expr({:cons, _h, _t, loc}, _env, _expected) do
+    {:error, error_with_loc("lists are not supported in BPF modules", loc,
       hint: "eBPF has no heap allocation"
     )}
   end
@@ -533,7 +577,7 @@ defmodule VaistoBpf.BpfTypeChecker do
   # Binary Arithmetic / Bitwise
   # ============================================================================
 
-  defp check_binary_arith(op, left, right, env, expected) do
+  defp check_binary_arith(op, left, right, env, expected, loc) do
     # Try to infer context from whichever side has a known type
     left_pre = pre_check_type(left, env)
     right_pre = pre_check_type(right, env)
@@ -545,17 +589,17 @@ defmodule VaistoBpf.BpfTypeChecker do
          {:ok, right_type, typed_right} <- check_expr(right, env, context || left_type) do
       cond do
         left_type not in @bpf_int_types ->
-          {:error, Error.new("#{op} requires integer operands, got #{format_type(left_type)}",
+          {:error, error_with_loc("#{op} requires integer operands, got #{format_type(left_type)}", loc,
             hint: "BPF arithmetic only works on fixed-width integer types"
           )}
 
         right_type not in @bpf_int_types ->
-          {:error, Error.new("#{op} requires integer operands, got #{format_type(right_type)}",
+          {:error, error_with_loc("#{op} requires integer operands, got #{format_type(right_type)}", loc,
             hint: "BPF arithmetic only works on fixed-width integer types"
           )}
 
         left_type != right_type ->
-          {:error, Error.new("#{op} requires both operands to be the same type",
+          {:error, error_with_loc("#{op} requires both operands to be the same type", loc,
             expected: left_type,
             actual: right_type,
             hint: "got #{format_type(left_type)} and #{format_type(right_type)} — BPF has no implicit widening"
@@ -571,7 +615,7 @@ defmodule VaistoBpf.BpfTypeChecker do
   # Comparisons
   # ============================================================================
 
-  defp check_comparison(op, left, right, env) do
+  defp check_comparison(op, left, right, env, loc) do
     left_pre = pre_check_type(left, env)
     right_pre = pre_check_type(right, env)
     context = left_pre || right_pre
@@ -581,7 +625,7 @@ defmodule VaistoBpf.BpfTypeChecker do
       if types_compatible?(left_type, right_type) do
         {:ok, :bool, {:call, op, [typed_left, typed_right], :bool}}
       else
-        {:error, Error.new("#{op} requires both operands to be the same type",
+        {:error, error_with_loc("#{op} requires both operands to be the same type", loc,
           expected: left_type,
           actual: right_type
         )}
@@ -769,7 +813,7 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   # Validate that context-typed parameters match the declared program type.
   # Skips validation when prog_type is nil (no annotation) or maps to nil context.
-  defp validate_context_params(params, env) do
+  defp validate_context_params(params, env, loc \\ nil) do
     prog_type = Map.get(env, :__prog_type__)
     expected_ctx = if prog_type, do: VaistoBpf.ContextTypes.context_for_program(prog_type)
 
@@ -789,8 +833,9 @@ defmodule VaistoBpf.BpfTypeChecker do
           :ok
 
         {_name, {:ptr, actual_ctx}} ->
-          {:error, Error.new(
+          {:error, error_with_loc(
             "wrong context type for :#{prog_type} program: expected #{expected_ctx}, got #{actual_ctx}",
+            loc,
             hint: "the :#{prog_type} program type requires a #{expected_ctx} context parameter"
           )}
       end
@@ -799,7 +844,13 @@ defmodule VaistoBpf.BpfTypeChecker do
 
   # Pre-check: peek at the type of an expression without full checking
   # Returns a type atom if known, nil otherwise
-  defp pre_check_type(name, env) when is_atom(name), do: Map.get(env, name)
+  defp pre_check_type(name, env) when is_atom(name) do
+    case Map.get(env, name) do
+      {:global, type} -> type
+      {:const_global, type} -> type
+      other -> other
+    end
+  end
   defp pre_check_type(_expr, _env), do: nil
 
   defp resolve_int_context(type) when type in @bpf_int_types, do: {:ok, type}
@@ -821,18 +872,19 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp is_bool_type?({:ok, :bool, _}, _), do: true
   defp is_bool_type?(_, _), do: false
 
-  defp validate_bpf_type(type) when type in @bpf_types, do: :ok
+  defp validate_bpf_type(type, loc \\ nil)
+  defp validate_bpf_type(type, _loc) when type in @bpf_types, do: :ok
 
-  defp validate_bpf_type(type) when type in @rejected_beam_types do
-    {:error, Error.new("type #{format_type(type)} is not supported in BPF modules",
+  defp validate_bpf_type(type, loc) when type in @rejected_beam_types do
+    {:error, error_with_loc("type #{format_type(type)} is not supported in BPF modules", loc,
       hint: "use fixed-width types: :u8, :u16, :u32, :u64, :i8, :i16, :i32, :i64"
     )}
   end
 
-  defp validate_bpf_type({:fn, args, ret}) do
-    with :ok <- validate_bpf_type(ret) do
+  defp validate_bpf_type({:fn, args, ret}, loc) do
+    with :ok <- validate_bpf_type(ret, loc) do
       Enum.reduce_while(args, :ok, fn t, :ok ->
-        case validate_bpf_type(t) do
+        case validate_bpf_type(t, loc) do
           :ok -> {:cont, :ok}
           err -> {:halt, err}
         end
@@ -840,45 +892,45 @@ defmodule VaistoBpf.BpfTypeChecker do
     end
   end
 
-  defp validate_bpf_type({:ptr, inner}), do: validate_bpf_type(inner)
-  defp validate_bpf_type(:none), do: :ok
+  defp validate_bpf_type({:ptr, inner}, loc), do: validate_bpf_type(inner, loc)
+  defp validate_bpf_type(:none, _loc), do: :ok
 
   # Record names (capitalized atoms) are valid BPF types when defined
-  defp validate_bpf_type(name) when is_atom(name) do
+  defp validate_bpf_type(name, loc) when is_atom(name) do
     if Atom.to_string(name) =~ ~r/^[A-Z]/ do
       :ok
     else
-      {:error, Error.new("unsupported type in BPF module: #{inspect(name)}")}
+      {:error, error_with_loc("unsupported type in BPF module: #{inspect(name)}", loc)}
     end
   end
 
-  defp validate_bpf_type({:record, _name, fields}), do: validate_fields(fields)
+  defp validate_bpf_type({:record, _name, fields}, loc), do: validate_fields(fields, loc)
 
-  defp validate_bpf_type(other) do
-    {:error, Error.new("unsupported type in BPF module: #{inspect(other)}")}
+  defp validate_bpf_type(other, loc) do
+    {:error, error_with_loc("unsupported type in BPF module: #{inspect(other)}", loc)}
   end
 
-  defp validate_fields(fields) do
+  defp validate_fields(fields, loc \\ nil) do
     Enum.reduce_while(fields, :ok, fn {_name, type}, :ok ->
-      case validate_bpf_type(type) do
+      case validate_bpf_type(type, loc) do
         :ok -> {:cont, :ok}
         err -> {:halt, err}
       end
     end)
   end
 
-  defp validate_param_types(params) do
+  defp validate_param_types(params, loc \\ nil) do
     Enum.reduce_while(params, :ok, fn {_name, type}, :ok ->
-      case validate_bpf_type(type) do
+      case validate_bpf_type(type, loc) do
         :ok -> {:cont, :ok}
         err -> {:halt, err}
       end
     end)
   end
 
-  defp validate_type_list(types) when is_list(types) do
+  defp validate_type_list(types, loc \\ nil) when is_list(types) do
     Enum.reduce_while(types, :ok, fn type, :ok ->
-      case validate_bpf_type(type) do
+      case validate_bpf_type(type, loc) do
         :ok -> {:cont, :ok}
         err -> {:halt, err}
       end
@@ -917,7 +969,7 @@ defmodule VaistoBpf.BpfTypeChecker do
   defp extract_map_name(_), do: nil
 
   # Resolve field access on a record type
-  defp resolve_field_access(record_name, field, typed_expr, env) do
+  defp resolve_field_access(record_name, field, typed_expr, env, loc \\ nil) do
     case Map.fetch(env, record_name) do
       {:ok, {:record, _name, fields}} ->
         case List.keyfind(fields, field, 0) do
@@ -926,28 +978,28 @@ defmodule VaistoBpf.BpfTypeChecker do
              {:field_access, typed_expr, field, field_type, record_name}}
 
           nil ->
-            {:error, Error.new("record `#{record_name}` has no field `#{field}`")}
+            {:error, error_with_loc("record `#{record_name}` has no field `#{field}`", loc)}
         end
 
       _ ->
-        {:error, Error.new("unknown record type `#{record_name}`")}
+        {:error, error_with_loc("unknown record type `#{record_name}`", loc)}
     end
   end
 
-  defp check_named_call(name, args, env) do
+  defp check_named_call(name, args, env, loc \\ nil) do
     case Map.fetch(env, name) do
       {:ok, {:fn, param_types, ret_type}} ->
         if length(args) != length(param_types) do
-          {:error, Error.new("function `#{name}` expects #{length(param_types)} arguments, got #{length(args)}")}
+          {:error, error_with_loc("function `#{name}` expects #{length(param_types)} arguments, got #{length(args)}", loc)}
         else
           check_call_args(name, args, param_types, ret_type, env)
         end
 
       {:ok, _} ->
-        {:error, Error.new("`#{name}` is not a function")}
+        {:error, error_with_loc("`#{name}` is not a function", loc)}
 
       :error ->
-        {:error, Error.new("unknown function `#{name}`",
+        {:error, error_with_loc("unknown function `#{name}`", loc,
           hint: if(String.first("#{name}") =~ ~r/[a-z]/,
             do: "recursion is not supported in BPF modules",
             else: nil
