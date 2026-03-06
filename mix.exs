@@ -18,6 +18,7 @@ defmodule VaistoBpf.MixProject do
 
   def application do
     [
+      mod: {VaistoBpf.Application, []},
       extra_applications: [:logger]
     ]
   end
@@ -28,7 +29,8 @@ defmodule VaistoBpf.MixProject do
   defp deps do
     [
       {:vaisto, path: "../vaisto"},
-      {:elixir_make, "~> 0.9", runtime: false}
+      {:elixir_make, "~> 0.9", runtime: false},
+      {:telemetry, "~> 1.0"}
     ]
   end
 end
