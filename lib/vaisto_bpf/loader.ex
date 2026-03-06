@@ -167,6 +167,7 @@ defmodule VaistoBpf.Loader do
            port: port,
            handles: %{},
            pending: nil,
+           queue: :queue.new(),
            subscribers: %{},
            monitors: %{}
          }}
@@ -253,8 +254,8 @@ defmodule VaistoBpf.Loader do
     end
   end
 
-  def handle_call(_msg, _from, %{pending: pending} = state) when pending != nil do
-    {:reply, {:error, "loader busy"}, state}
+  def handle_call(msg, from, %{pending: pending} = state) when pending != nil do
+    {:noreply, %{state | queue: :queue.in({msg, from}, state.queue)}}
   end
 
   @impl true
@@ -274,7 +275,7 @@ defmodule VaistoBpf.Loader do
   # Drain response — fire-and-forget unsubscribe from :DOWN handler.
   # Events (0x10) are already matched above, so this only catches command responses.
   def handle_info({port, {:data, _data}}, %{port: port, pending: {:drain, _cmd, _extra}} = state) do
-    {:noreply, %{state | pending: nil}}
+    {:noreply, dequeue_next(%{state | pending: nil})}
   end
 
   # Command responses — existing logic (pending must be set)
@@ -312,25 +313,28 @@ defmodule VaistoBpf.Loader do
     case result do
       {:reply_state, reply, new_state} ->
         GenServer.reply(from, reply)
-        {:noreply, %{new_state | pending: nil}}
+        new_state = %{new_state | pending: nil}
+        {:noreply, dequeue_next(new_state)}
     end
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     reason = {:port_exit, status}
+    error = {:error, "port exited with status #{status}"}
 
     case state.pending do
       {:drain, _cmd, _extra} ->
         :ok
 
       {from, _cmd, _extra} ->
-        GenServer.reply(from, {:error, "port exited with status #{status}"})
+        GenServer.reply(from, error)
 
       nil ->
         :ok
     end
 
-    {:stop, reason, %{state | pending: nil}}
+    drain_queue(state.queue, error)
+    {:stop, reason, %{state | pending: nil, queue: :queue.new()}}
   end
 
   # Subscriber process died — clean up
@@ -376,6 +380,110 @@ defmodule VaistoBpf.Loader do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  defp drain_queue(queue, error) do
+    case :queue.out(queue) do
+      {:empty, _} -> :ok
+      {{:value, {_msg, from}}, rest} ->
+        GenServer.reply(from, error)
+        drain_queue(rest, error)
+    end
+  end
+
+  # -- Private: request queue --
+
+  defp dequeue_next(%{pending: nil, queue: queue} = state) do
+    case :queue.out(queue) do
+      {:empty, _} ->
+        state
+
+      {{:value, {msg, from}}, new_queue} ->
+        # Re-dispatch the queued message via handle_call
+        state = %{state | queue: new_queue}
+        dispatch_queued(msg, from, state)
+    end
+  end
+
+  defp dequeue_next(state), do: state
+
+  defp dispatch_queued({:load, elf_binary, prog_type, attach_target}, from, state) do
+    data = Protocol.encode_load(elf_binary, prog_type, attach_target)
+    Port.command(state.port, data)
+    %{state | pending: {from, :load, attach_target}}
+  end
+
+  defp dispatch_queued({:load_xdp, elf_binary, interface}, from, state) do
+    data = Protocol.encode_load_xdp(elf_binary, interface)
+    Port.command(state.port, data)
+    %{state | pending: {from, :load_xdp, interface}}
+  end
+
+  defp dispatch_queued({:detach, handle}, from, state) do
+    data = Protocol.encode_detach(handle)
+    Port.command(state.port, data)
+    %{state | pending: {from, :detach, handle}}
+  end
+
+  defp dispatch_queued({:map_lookup, handle, map_name, key}, from, state) do
+    data = Protocol.encode_map_lookup(handle, map_name, key)
+    Port.command(state.port, data)
+    %{state | pending: {from, :map_lookup, nil}}
+  end
+
+  defp dispatch_queued({:map_update, handle, map_name, key, value, flags}, from, state) do
+    data = Protocol.encode_map_update(handle, map_name, key, value, flags)
+    Port.command(state.port, data)
+    %{state | pending: {from, :map_update, nil}}
+  end
+
+  defp dispatch_queued({:map_delete, handle, map_name, key}, from, state) do
+    data = Protocol.encode_map_delete(handle, map_name, key)
+    Port.command(state.port, data)
+    %{state | pending: {from, :map_delete, nil}}
+  end
+
+  defp dispatch_queued({:map_get_next_key, handle, map_name, key}, from, state) do
+    data = Protocol.encode_map_get_next_key(handle, map_name, key)
+    Port.command(state.port, data)
+    %{state | pending: {from, :map_get_next_key, nil}}
+  end
+
+  defp dispatch_queued({:subscribe_ringbuf, handle, map_name, pid}, from, state) do
+    key = {handle, map_name}
+    current = Map.get(state.subscribers, key, MapSet.new())
+
+    if MapSet.size(current) == 0 do
+      data = Protocol.encode_subscribe_ringbuf(handle, map_name)
+      Port.command(state.port, data)
+      %{state | pending: {from, :subscribe_ringbuf, {key, pid}}}
+    else
+      state = add_subscriber(state, key, pid)
+      GenServer.reply(from, :ok)
+      state
+    end
+  end
+
+  defp dispatch_queued({:unsubscribe_ringbuf, handle, map_name, pid}, from, state) do
+    key = {handle, map_name}
+    current = Map.get(state.subscribers, key, MapSet.new())
+
+    if not MapSet.member?(current, pid) do
+      GenServer.reply(from, :ok)
+      state
+    else
+      state = remove_subscriber(state, key, pid)
+      new_current = Map.get(state.subscribers, key, MapSet.new())
+
+      if MapSet.size(new_current) == 0 do
+        data = Protocol.encode_unsubscribe_ringbuf(handle, map_name)
+        Port.command(state.port, data)
+        %{state | pending: {from, :unsubscribe_ringbuf, nil}}
+      else
+        GenServer.reply(from, :ok)
+        state
+      end
+    end
+  end
 
   # -- Private: subscriber management --
 
