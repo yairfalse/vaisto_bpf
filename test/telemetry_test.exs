@@ -19,11 +19,11 @@ defmodule VaistoBpf.TelemetryTest do
         nil
       )
 
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       Telemetry.event([:vaisto_bpf, :test, :event], %{duration: 42}, %{map_name: :counters})
 
       assert_receive {:telemetry, [:vaisto_bpf, :test, :event], %{duration: 42}, %{map_name: :counters}}
-
-      :telemetry.detach(handler_id)
     end
   end
 
@@ -46,6 +46,8 @@ defmodule VaistoBpf.TelemetryTest do
         nil
       )
 
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       result = Telemetry.span([:vaisto_bpf, :test, :span], %{key: :val}, fn ->
         {42, %{key: :val}}
       end)
@@ -54,8 +56,6 @@ defmodule VaistoBpf.TelemetryTest do
 
       assert_receive {:telemetry, [:vaisto_bpf, :test, :span, :start], _, %{key: :val}}
       assert_receive {:telemetry, [:vaisto_bpf, :test, :span, :stop], %{duration: _}, %{key: :val}}
-
-      :telemetry.detach(handler_id)
     end
   end
 end

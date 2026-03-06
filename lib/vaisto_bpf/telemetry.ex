@@ -2,10 +2,15 @@ defmodule VaistoBpf.Telemetry do
   @moduledoc """
   Telemetry events emitted by vaisto_bpf.
 
-  ## Events
+  ## Span Events (emitted as `:start` / `:stop` pairs)
+
+      [:vaisto_bpf, :compile, :start]
+        measurements: %{system_time: integer}
 
       [:vaisto_bpf, :compile, :stop]
         measurements: %{duration: native_time}
+
+  ## Discrete Events
 
       [:vaisto_bpf, :program, :start]
         metadata: %{prog_type: atom, attach_target: String.t()}
