@@ -459,7 +459,7 @@ defmodule VaistoBpf.Loader do
     else
       state = add_subscriber(state, key, pid)
       GenServer.reply(from, :ok)
-      state
+      dequeue_next(state)
     end
   end
 
@@ -469,7 +469,7 @@ defmodule VaistoBpf.Loader do
 
     if not MapSet.member?(current, pid) do
       GenServer.reply(from, :ok)
-      state
+      dequeue_next(state)
     else
       state = remove_subscriber(state, key, pid)
       new_current = Map.get(state.subscribers, key, MapSet.new())
@@ -480,7 +480,7 @@ defmodule VaistoBpf.Loader do
         %{state | pending: {from, :unsubscribe_ringbuf, nil}}
       else
         GenServer.reply(from, :ok)
-        state
+        dequeue_next(state)
       end
     end
   end
