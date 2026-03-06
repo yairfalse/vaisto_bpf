@@ -70,8 +70,13 @@ defmodule VaistoBpf.Schema.MapSchema do
       VaistoBpf.Codec.for_type(type)
     else
       case Map.fetch(record_defs, type) do
-        {:ok, fields} -> VaistoBpf.Codec.for_record(fields, record_defs)
-        :error -> nil
+        {:ok, fields} ->
+          VaistoBpf.Codec.for_record(fields, record_defs)
+
+        :error ->
+          raise ArgumentError,
+            "unknown record type #{inspect(type)} referenced in map schema; " <>
+            "available: #{inspect(Map.keys(record_defs))}"
       end
     end
   end

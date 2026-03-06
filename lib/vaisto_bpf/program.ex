@@ -147,14 +147,15 @@ defmodule VaistoBpf.Program do
   end
 
   def handle_call(:detach, _from, state) do
-    result = Loader.detach(state.loader, state.handle)
-    {:reply, result, %{state | handle: nil}}
+    case Loader.detach(state.loader, state.handle) do
+      :ok -> {:reply, :ok, %{state | handle: nil}}
+      {:error, _} = err -> {:reply, err, state}
+    end
   end
 
   def handle_call({:map_lookup, map_name, key}, _from, state) do
     with {:ok, %MapSchema{} = ms} <- fetch_map_schema(state, map_name),
-         {enc, _} <- ms.key_codec,
-         {_, dec} <- ms.value_codec do
+         {:ok, {enc, _}, {_, dec}} <- require_codecs(ms) do
       encoded_key = enc.(key)
       start_time = System.monotonic_time()
 
@@ -175,8 +176,7 @@ defmodule VaistoBpf.Program do
 
   def handle_call({:map_update, map_name, key, value}, _from, state) do
     with {:ok, %MapSchema{} = ms} <- fetch_map_schema(state, map_name),
-         {enc_k, _} <- ms.key_codec,
-         {enc_v, _} <- ms.value_codec do
+         {:ok, {enc_k, _}, {enc_v, _}} <- require_codecs(ms) do
       encoded_key = enc_k.(key)
       encoded_val = enc_v.(value)
       start_time = System.monotonic_time()
@@ -200,7 +200,7 @@ defmodule VaistoBpf.Program do
 
   def handle_call({:map_delete, map_name, key}, _from, state) do
     with {:ok, %MapSchema{} = ms} <- fetch_map_schema(state, map_name),
-         {enc, _} <- ms.key_codec do
+         {:ok, {enc, _}, _} <- require_key_codec(ms) do
       encoded_key = enc.(key)
       start_time = System.monotonic_time()
       result = Loader.map_delete(state.loader, state.handle, Atom.to_string(map_name), encoded_key)
@@ -214,7 +214,7 @@ defmodule VaistoBpf.Program do
 
   def handle_call({:map_keys, map_name}, _from, state) do
     with {:ok, %MapSchema{} = ms} <- fetch_map_schema(state, map_name),
-         {_, dec} <- ms.key_codec do
+         {:ok, {_, dec}, _} <- require_key_codec(ms) do
       case Loader.map_keys(state.loader, state.handle, Atom.to_string(map_name)) do
         {:ok, raw_keys} -> {:reply, {:ok, Enum.map(raw_keys, dec)}, state}
         {:error, _} = err -> {:reply, err, state}
@@ -305,33 +305,38 @@ defmodule VaistoBpf.Program do
   def handle_call({:unsubscribe, map_name, pid}, _from, state) do
     current = Map.get(state.subscribers, map_name, MapSet.new())
 
-    state =
-      if MapSet.member?(current, pid) do
-        remove_subscriber(state, map_name, pid)
-      else
-        state
-      end
-
-    remaining = Map.get(state.subscribers, map_name, MapSet.new())
-
-    if MapSet.size(remaining) == 0 and MapSet.size(current) > 0 do
-      Loader.unsubscribe_ringbuf(state.loader, state.handle, Atom.to_string(map_name), self())
+    if not MapSet.member?(current, pid) do
       {:reply, :ok, state}
     else
-      {:reply, :ok, state}
+      state = remove_subscriber(state, map_name, pid)
+      remaining = Map.get(state.subscribers, map_name, MapSet.new())
+
+      if MapSet.size(remaining) == 0 do
+        case Loader.unsubscribe_ringbuf(state.loader, state.handle, Atom.to_string(map_name), self()) do
+          :ok ->
+            {:reply, :ok, state}
+
+          {:error, _} = err ->
+            # Revert: re-add subscriber since unsubscribe failed
+            state = add_subscriber(state, map_name, pid)
+            {:reply, err, state}
+        end
+      else
+        {:reply, :ok, state}
+      end
     end
   end
 
   @impl true
   def handle_info({:ringbuf_event, _handle, map_name, raw_data}, state) do
-    VaistoBpf.Telemetry.event(
-      [:vaisto_bpf, :ringbuf, :event],
-      %{byte_size: byte_size(raw_data)},
-      %{map_name: map_name}
-    )
-
     case find_map_by_string_name(state.schema.maps, map_name) do
       {map_atom, %MapSchema{value_codec: {_, dec}}} when dec != nil ->
+        VaistoBpf.Telemetry.event(
+          [:vaisto_bpf, :ringbuf, :event],
+          %{byte_size: byte_size(raw_data)},
+          %{map_name: map_atom}
+        )
+
         decoded = dec.(raw_data)
 
         for pid <- Map.get(state.subscribers, map_atom, MapSet.new()) do
@@ -339,6 +344,12 @@ defmodule VaistoBpf.Program do
         end
 
       {map_atom, _} ->
+        VaistoBpf.Telemetry.event(
+          [:vaisto_bpf, :ringbuf, :event],
+          %{byte_size: byte_size(raw_data)},
+          %{map_name: map_atom}
+        )
+
         for pid <- Map.get(state.subscribers, map_atom, MapSet.new()) do
           send(pid, {:bpf_event, state.ref, map_atom, raw_data})
         end
@@ -399,6 +410,18 @@ defmodule VaistoBpf.Program do
       :error -> {:error, {:unknown_global, name}}
     end
   end
+
+  defp require_codecs(%MapSchema{key_codec: nil, name: name}),
+    do: {:error, {:missing_codec, name}}
+  defp require_codecs(%MapSchema{value_codec: nil, name: name}),
+    do: {:error, {:missing_codec, name}}
+  defp require_codecs(%MapSchema{key_codec: kc, value_codec: vc}),
+    do: {:ok, kc, vc}
+
+  defp require_key_codec(%MapSchema{key_codec: nil, name: name}),
+    do: {:error, {:missing_codec, name}}
+  defp require_key_codec(%MapSchema{key_codec: kc, value_codec: vc}),
+    do: {:ok, kc, vc}
 
   defp section_map_name(:bss), do: ".bss"
   defp section_map_name(:data), do: ".data"
