@@ -38,6 +38,8 @@ defmodule VaistoBpf do
   alias VaistoBpf.Emitter
   alias VaistoBpf.Assembler
   alias VaistoBpf.ElfWriter
+  alias VaistoBpf.Schema
+  alias VaistoBpf.Schema.{MapSchema, GlobalSchema}
 
   @doc """
   Compile typed Vaisto AST to eBPF bytecode.
@@ -93,6 +95,13 @@ defmodule VaistoBpf do
   """
   @spec compile_source_to_elf(String.t(), keyword()) :: {:ok, binary()} | {:error, Vaisto.Error.t()}
   def compile_source_to_elf(source, opts \\ []) do
+    VaistoBpf.Telemetry.span([:vaisto_bpf, :compile], %{}, fn ->
+      result = do_compile_source_to_elf(source, opts)
+      {result, %{}}
+    end)
+  end
+
+  defp do_compile_source_to_elf(source, opts) do
     {cleaned, section_name, prog_type} = Preprocessor.extract_program(source)
     {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
     {cleaned, globals} = Preprocessor.extract_defglobals(cleaned)
@@ -111,6 +120,103 @@ defmodule VaistoBpf do
       elf_opts = if section_name, do: Keyword.put_new(elf_opts, :section, section_name), else: elf_opts
       elf_opts = if prog_type, do: Keyword.put_new(elf_opts, :prog_type, prog_type), else: elf_opts
       ElfWriter.to_elf(instructions, elf_opts)
+    end
+  end
+
+  @doc """
+  One-liner: compile source, load, and attach.
+
+  Returns `{:ok, program_pid}` or `{:error, reason}`.
+  Requires the OTP application to be running (Loader + ProgramSupervisor).
+
+  Options:
+    - `:attach_target` — override the attach target (default: second argument)
+    - Any option accepted by `compile_source_to_schema/2`
+  """
+  def run(source, attach_target \\ "", opts \\ []) do
+    unless VaistoBpf.Application.runtime_available?() do
+      {:error, :runtime_not_available}
+    else
+      opts = Keyword.put_new(opts, :attach_target, attach_target)
+
+      with {:ok, schema} <- compile_source_to_schema(source, opts) do
+        DynamicSupervisor.start_child(
+          VaistoBpf.ProgramSupervisor,
+          {VaistoBpf.Program, {schema, VaistoBpf.Loader, opts}}
+        )
+      end
+    end
+  end
+
+  @doc """
+  Compile source to a Schema containing the ELF binary plus all metadata.
+
+  The Schema captures map definitions (with codecs), global variables,
+  record types, and function signatures — everything needed for typed
+  runtime access via `VaistoBpf.Program`.
+
+  Works on all platforms (no loader required).
+  """
+  @spec compile_source_to_schema(String.t(), keyword()) ::
+          {:ok, Schema.t()} | {:error, Vaisto.Error.t()}
+  def compile_source_to_schema(source, opts \\ []) do
+    VaistoBpf.Telemetry.span([:vaisto_bpf, :compile], %{}, fn ->
+      result = do_compile_source_to_schema(source, opts)
+      {result, %{}}
+    end)
+  end
+
+  defp do_compile_source_to_schema(source, opts) do
+    {cleaned, section_name, prog_type} = Preprocessor.extract_program(source)
+    {cleaned, maps} = Preprocessor.extract_defmaps(cleaned)
+    {cleaned, globals} = Preprocessor.extract_defglobals(cleaned)
+    preprocessed = Preprocessor.preprocess_source(cleaned)
+    parsed = Vaisto.Parser.parse(preprocessed)
+    normalized = Preprocessor.normalize_ast(parsed)
+
+    with {:ok, _type, typed_ast} <- BpfTypeChecker.check(normalized, maps, prog_type, globals),
+         :ok <- Safety.check(typed_ast),
+         {:ok, ast} <- Validator.validate(typed_ast),
+         {:ok, ir} <- Emitter.emit(ast, maps, globals, opts),
+         {:ok, instructions, relocations, func_offsets, core_relos} <- Assembler.assemble(ir) do
+      func_sigs = extract_function_signatures(typed_ast)
+      records = extract_record_defs(typed_ast)
+
+      elf_opts = opts ++ [maps: maps, relocations: relocations, func_offsets: func_offsets,
+                          globals: globals, func_sigs: func_sigs, core_relos: core_relos]
+      elf_opts = if section_name, do: Keyword.put_new(elf_opts, :section, section_name), else: elf_opts
+      elf_opts = if prog_type, do: Keyword.put_new(elf_opts, :prog_type, prog_type), else: elf_opts
+
+      with {:ok, elf_binary} <- ElfWriter.to_elf(instructions, elf_opts) do
+        # Include context types in record defs for subscriber decoding
+        all_records = Map.merge(VaistoBpf.ContextTypes.all() |> Map.new(fn {k, v} -> {k, v} end), records)
+
+        assigned_globals = VaistoBpf.GlobalDef.assign_offsets(globals)
+
+        map_schemas =
+          maps
+          |> Enum.map(fn md -> {md.name, MapSchema.from_map_def(md, all_records)} end)
+          |> Map.new()
+
+        global_schemas =
+          assigned_globals
+          |> Enum.map(fn gd -> {gd.name, GlobalSchema.from_global_def(gd)} end)
+          |> Map.new()
+
+        attach_target = Keyword.get(opts, :attach_target)
+
+        {:ok,
+         %Schema{
+           elf_binary: elf_binary,
+           prog_type: prog_type,
+           attach_target: attach_target,
+           section_name: section_name,
+           maps: map_schemas,
+           records: records,
+           globals: global_schemas,
+           functions: func_sigs
+         }}
+      end
     end
   end
 
@@ -166,6 +272,19 @@ defmodule VaistoBpf do
   end
 
   defp extract_function_signatures(_), do: []
+
+  # Extract record (deftype product) definitions from typed AST.
+  # Returns %{name => [{field, type}]}.
+  defp extract_record_defs({:module, forms}) do
+    forms
+    |> Enum.filter(&match?({:deftype, _, {:product, _}, _}, &1))
+    |> Enum.map(fn {:deftype, name, {:product, fields}, _type} ->
+      {name, fields}
+    end)
+    |> Map.new()
+  end
+
+  defp extract_record_defs(_), do: %{}
 
   defp extract_param_types(_params, {:fn, param_types, _ret}) do
     Enum.map(param_types, &normalize_btf_type/1)
