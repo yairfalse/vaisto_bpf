@@ -11,7 +11,7 @@ eBPF backend for the Vaisto programming language. Compiles S-expression source t
 ```bash
 mix deps.get                              # Requires ../vaisto sibling checkout
 mix compile                               # On Linux: also builds c_src/bpf_loader.c → priv/bpf_loader
-mix test                                  # ~717 tests; :linux tag excluded by default
+mix test                                  # ~722 tests; :linux tag excluded by default
 mix test test/codec_test.exs              # Single file
 mix test test/codec_test.exs:42           # Single test by line
 mix test --include linux                  # Include kernel integration tests (Linux only)
@@ -50,16 +50,16 @@ The Assembler runs two passes: (1) builds `%{label => instruction_index}` accoun
 
 ## C Port Protocol
 
-The Loader communicates with `priv/bpf_loader` via Erlang port with `{:packet, 2}`. Commands: LOAD_XDP(0x01), DETACH(0x02), MAP_LOOKUP(0x03), MAP_UPDATE(0x04), MAP_DELETE(0x05), SUBSCRIBE_RINGBUF(0x06), UNSUBSCRIBE_RINGBUF(0x07), MAP_GET_NEXT_KEY(0x08), LOAD(0x09). Unsolicited ring buffer events arrive as 0x10-prefixed messages. Protocol encode/decode lives in `loader/protocol.ex`. The C port handles up to 16 loaded BPF objects and 8 simultaneous ring buffer subscriptions via epoll.
+The Loader communicates with `priv/bpf_loader` via Erlang port with `{:packet, 2}`. Commands: LOAD_XDP(0x01), DETACH(0x02), MAP_LOOKUP(0x03), MAP_UPDATE(0x04), MAP_DELETE(0x05), SUBSCRIBE_RINGBUF(0x06), UNSUBSCRIBE_RINGBUF(0x07), MAP_GET_NEXT_KEY(0x08), LOAD(0x09), SUBSCRIBE_PERFBUF(0x0A), UNSUBSCRIBE_PERFBUF(0x0B). Unsolicited events: ring buffer data(0x10), perf buffer data(0x11), perf buffer lost(0x12). Protocol encode/decode lives in `loader/protocol.ex`. The C port handles up to 16 loaded BPF objects, 8 ring buffer and 8 perf buffer subscriptions via epoll.
 
 ## Runtime Layer (Phases 7-10)
 
 - **Schema** (`schema.ex`) — captures compile-time metadata (map schemas with codecs, globals, records, function sigs) so it survives the ELF boundary
 - **Codec** (`codec.ex`) — runtime `{encode_fn, decode_fn}` closure pairs for BPF primitives and C-aligned records; supports nested records via `for_type/2` with `record_defs`
-- **Program** (`program.ex`) — GenServer wrapping a loaded BPF program; typed map access (`map_lookup/3` auto-encodes key, auto-decodes value), ring buffer event dispatch with subscriber monitoring, global read/write by name
+- **Program** (`program.ex`) — GenServer wrapping a loaded BPF program; typed map access (`map_lookup/3` auto-encodes key, auto-decodes value), ring buffer and perf buffer event dispatch with subscriber monitoring, global read/write by name
 - **Loader** (`loader.ex`) — GenServer managing the C port; request queuing via `:queue`, drains queue on port exit
 - **Application** (`application.ex`) — starts Loader + DynamicSupervisor on Linux only; empty on macOS
-- **Telemetry** (`telemetry.ex`) — `:telemetry` events for compile spans, map ops, program lifecycle, ringbuf events, verifier rejections
+- **Telemetry** (`telemetry.ex`) — `:telemetry` events for compile spans, map ops, program lifecycle, ringbuf/perfbuf events, verifier rejections
 
 ## Key Design Patterns
 
@@ -78,6 +78,7 @@ The Loader communicates with `priv/bpf_loader` via Erlang port with `{:packet, 2
 ```scheme
 (program :xdp)                              ; program type declaration
 (defmap counters :hash :u32 :u64 1024)      ; map definition
+(defmap events :perf_event_array 0 0 128)   ; perf event buffer (per-CPU)
 (defglobal counter :u64)                    ; mutable global (.bss)
 (defconst max_val :u32 100)                 ; read-only global (.rodata)
 (deftype Event [ts :u64 pid :u32])          ; record type (NOT (product [...]))

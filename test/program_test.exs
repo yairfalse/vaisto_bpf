@@ -99,7 +99,16 @@ defmodule VaistoBpf.ProgramTest do
     end
 
     def handle_call({:unsubscribe_ringbuf, _handle, map_name, _pid}, _from, state) do
-      state = %{state | unsubscribe_calls: [map_name | state.unsubscribe_calls]}
+      state = %{state | unsubscribe_calls: [{:ringbuf, map_name} | state.unsubscribe_calls]}
+      {:reply, :ok, state}
+    end
+
+    def handle_call({:subscribe_perfbuf, _handle, _map_name, _pid}, _from, state) do
+      {:reply, :ok, state}
+    end
+
+    def handle_call({:unsubscribe_perfbuf, _handle, map_name, _pid}, _from, state) do
+      state = %{state | unsubscribe_calls: [{:perfbuf, map_name} | state.unsubscribe_calls]}
       {:reply, :ok, state}
     end
   end
@@ -312,7 +321,7 @@ defmodule VaistoBpf.ProgramTest do
     test "subscribe to non-ringbuf map returns error" do
       {prog, _loader} = start_program()
 
-      assert {:error, {:not_ringbuf, :counters}} = Program.subscribe(prog, :counters)
+      assert {:error, {:not_event_buffer, :counters}} = Program.subscribe(prog, :counters)
 
       Program.stop(prog)
     end
@@ -411,7 +420,82 @@ defmodule VaistoBpf.ProgramTest do
 
       # Verify unsubscribe was called on the loader
       unsubscribe_calls = GenServer.call(loader, :get_unsubscribe_calls)
-      assert "events" in unsubscribe_calls
+      assert {:ringbuf, "events"} in unsubscribe_calls
+
+      Program.stop(prog)
+    end
+  end
+
+  describe "perf buffer subscription" do
+    setup do
+      perfbuf_map = %MapSchema{
+        name: :perf_events,
+        map_type: :perf_event_array,
+        key_type: :none,
+        value_type: :u64,
+        max_entries: 128,
+        key_codec: nil,
+        value_codec: Codec.for_type(:u64)
+      }
+
+      {:ok, loader} = MockLoader.start_link()
+      schema = build_schema(extra_maps: %{perf_events: perfbuf_map})
+      {:ok, prog} = Program.start_link(schema, loader)
+      %{prog: prog, loader: loader}
+    end
+
+    test "subscribe to perf_event_array map succeeds", %{prog: prog} do
+      assert :ok = Program.subscribe(prog, :perf_events)
+      Program.stop(prog)
+    end
+
+    test "subscribe to non-event-buffer map returns error" do
+      {prog, _loader} = start_program()
+      assert {:error, {:not_event_buffer, :counters}} = Program.subscribe(prog, :counters)
+      Program.stop(prog)
+    end
+
+    test "perfbuf_event delivers decoded :bpf_event to subscribers", %{prog: prog} do
+      :ok = Program.subscribe(prog, :perf_events)
+
+      send(prog, {:perfbuf_event, 1, "perf_events", <<42::little-64>>})
+
+      assert_receive {:bpf_event, _ref, :perf_events, 42}, 1000
+      Program.stop(prog)
+    end
+
+    test "perfbuf_lost delivers :bpf_lost_events to subscribers", %{prog: prog} do
+      :ok = Program.subscribe(prog, :perf_events)
+
+      send(prog, {:perfbuf_lost, 1, "perf_events", 17})
+
+      assert_receive {:bpf_lost_events, _ref, :perf_events, 17}, 1000
+      Program.stop(prog)
+    end
+
+    test "subscriber death triggers perfbuf auto-cleanup", %{prog: prog, loader: loader} do
+      test_pid = self()
+      subscriber = spawn(fn ->
+        send(test_pid, :ready)
+        receive do :stop -> :ok end
+      end)
+
+      receive do :ready -> :ok end
+
+      :ok = GenServer.call(prog, {:subscribe, :perf_events, subscriber})
+
+      state = :sys.get_state(prog)
+      assert MapSet.member?(state.subscribers[:perf_events], subscriber)
+
+      Process.exit(subscriber, :kill)
+      :timer.sleep(50)
+
+      state = :sys.get_state(prog)
+      remaining = Map.get(state.subscribers, :perf_events, MapSet.new())
+      assert MapSet.size(remaining) == 0
+
+      unsubscribe_calls = GenServer.call(loader, :get_unsubscribe_calls)
+      assert {:perfbuf, "perf_events"} in unsubscribe_calls
 
       Program.stop(prog)
     end

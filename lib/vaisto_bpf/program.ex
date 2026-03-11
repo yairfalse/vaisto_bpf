@@ -280,11 +280,17 @@ defmodule VaistoBpf.Program do
   end
 
   def handle_call({:subscribe, map_name, pid}, _from, state) do
-    with {:ok, %MapSchema{map_type: :ringbuf}} <- fetch_map_schema(state, map_name) do
+    with {:ok, %MapSchema{map_type: mt}} when mt in [:ringbuf, :perf_event_array] <-
+           fetch_map_schema(state, map_name) do
       current = Map.get(state.subscribers, map_name, MapSet.new())
 
+      subscribe_fn = case mt do
+        :ringbuf -> &Loader.subscribe_ringbuf/4
+        :perf_event_array -> &Loader.subscribe_perfbuf/4
+      end
+
       if MapSet.size(current) == 0 do
-        case Loader.subscribe_ringbuf(state.loader, state.handle, Atom.to_string(map_name), self()) do
+        case subscribe_fn.(state.loader, state.handle, Atom.to_string(map_name), self()) do
           :ok ->
             state = add_subscriber(state, map_name, pid)
             {:reply, :ok, state}
@@ -297,7 +303,7 @@ defmodule VaistoBpf.Program do
         {:reply, :ok, state}
       end
     else
-      {:ok, %MapSchema{}} -> {:reply, {:error, {:not_ringbuf, map_name}}, state}
+      {:ok, %MapSchema{}} -> {:reply, {:error, {:not_event_buffer, map_name}}, state}
       {:error, _} = err -> {:reply, err, state}
     end
   end
@@ -312,12 +318,17 @@ defmodule VaistoBpf.Program do
       remaining = Map.get(state.subscribers, map_name, MapSet.new())
 
       if MapSet.size(remaining) == 0 do
-        case Loader.unsubscribe_ringbuf(state.loader, state.handle, Atom.to_string(map_name), self()) do
+        unsubscribe_fn = case get_map_type(state, map_name) do
+          :ringbuf -> &Loader.unsubscribe_ringbuf/4
+          :perf_event_array -> &Loader.unsubscribe_perfbuf/4
+          _ -> &Loader.unsubscribe_ringbuf/4
+        end
+
+        case unsubscribe_fn.(state.loader, state.handle, Atom.to_string(map_name), self()) do
           :ok ->
             {:reply, :ok, state}
 
           {:error, _} = err ->
-            # Revert: re-add subscriber since unsubscribe failed
             state = add_subscriber(state, map_name, pid)
             {:reply, err, state}
         end
@@ -361,6 +372,59 @@ defmodule VaistoBpf.Program do
     {:noreply, state}
   end
 
+  def handle_info({:perfbuf_event, _handle, map_name, raw_data}, state) do
+    case find_map_by_string_name(state.schema.maps, map_name) do
+      {map_atom, %MapSchema{value_codec: {_, dec}}} when dec != nil ->
+        VaistoBpf.Telemetry.event(
+          [:vaisto_bpf, :perfbuf, :event],
+          %{byte_size: byte_size(raw_data)},
+          %{map_name: map_atom}
+        )
+
+        decoded = dec.(raw_data)
+
+        for pid <- Map.get(state.subscribers, map_atom, MapSet.new()) do
+          send(pid, {:bpf_event, state.ref, map_atom, decoded})
+        end
+
+      {map_atom, _} ->
+        VaistoBpf.Telemetry.event(
+          [:vaisto_bpf, :perfbuf, :event],
+          %{byte_size: byte_size(raw_data)},
+          %{map_name: map_atom}
+        )
+
+        for pid <- Map.get(state.subscribers, map_atom, MapSet.new()) do
+          send(pid, {:bpf_event, state.ref, map_atom, raw_data})
+        end
+
+      nil ->
+        :ok
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:perfbuf_lost, _handle, map_name, lost_count}, state) do
+    case find_map_by_string_name(state.schema.maps, map_name) do
+      {map_atom, _} ->
+        VaistoBpf.Telemetry.event(
+          [:vaisto_bpf, :perfbuf, :lost],
+          %{lost_count: lost_count},
+          %{map_name: map_atom}
+        )
+
+        for pid <- Map.get(state.subscribers, map_atom, MapSet.new()) do
+          send(pid, {:bpf_lost_events, state.ref, map_atom, lost_count})
+        end
+
+      nil ->
+        :ok
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     case Map.pop(state.monitors, ref) do
       {{map_name, ^pid}, monitors} ->
@@ -370,7 +434,12 @@ defmodule VaistoBpf.Program do
         state = put_in_subscribers(state, map_name, new_set)
 
         if MapSet.size(new_set) == 0 and MapSet.size(current) > 0 do
-          Loader.unsubscribe_ringbuf(state.loader, state.handle, Atom.to_string(map_name), self())
+          case get_map_type(state, map_name) do
+            :perf_event_array ->
+              Loader.unsubscribe_perfbuf(state.loader, state.handle, Atom.to_string(map_name), self())
+            _ ->
+              Loader.unsubscribe_ringbuf(state.loader, state.handle, Atom.to_string(map_name), self())
+          end
         end
 
         {:noreply, state}
@@ -454,6 +523,13 @@ defmodule VaistoBpf.Program do
 
   defp put_in_subscribers(state, map_name, set) do
     %{state | subscribers: Map.put(state.subscribers, map_name, set)}
+  end
+
+  defp get_map_type(state, map_name) do
+    case Map.fetch(state.schema.maps, map_name) do
+      {:ok, %MapSchema{map_type: mt}} -> mt
+      :error -> nil
+    end
   end
 
   defp find_map_by_string_name(schema_maps, name_str) do

@@ -144,6 +144,20 @@ defmodule VaistoBpf.Loader do
     GenServer.call(server, {:unsubscribe_ringbuf, handle, map_name, subscriber}, :infinity)
   end
 
+  @doc "Subscribe a process to perf buffer events from a BPF map."
+  @spec subscribe_perfbuf(GenServer.server(), non_neg_integer(), String.t(), pid()) ::
+          :ok | {:error, String.t()}
+  def subscribe_perfbuf(server, handle, map_name, subscriber \\ self()) do
+    GenServer.call(server, {:subscribe_perfbuf, handle, map_name, subscriber}, :infinity)
+  end
+
+  @doc "Unsubscribe a process from perf buffer events."
+  @spec unsubscribe_perfbuf(GenServer.server(), non_neg_integer(), String.t(), pid()) ::
+          :ok | {:error, String.t()}
+  def unsubscribe_perfbuf(server, handle, map_name, subscriber \\ self()) do
+    GenServer.call(server, {:unsubscribe_perfbuf, handle, map_name, subscriber}, :infinity)
+  end
+
   # -- GenServer callbacks --
 
   @impl true
@@ -228,7 +242,7 @@ defmodule VaistoBpf.Loader do
       {:noreply, %{state | pending: {from, :subscribe_ringbuf, {key, pid}}}}
     else
       # Already subscribed at C level — just add locally
-      state = add_subscriber(state, key, pid)
+      state = add_subscriber(state, key, pid, :ringbuf)
       {:reply, :ok, state}
     end
   end
@@ -254,6 +268,40 @@ defmodule VaistoBpf.Loader do
     end
   end
 
+  def handle_call({:subscribe_perfbuf, handle, map_name, pid}, from, %{pending: nil} = state) do
+    key = {handle, map_name}
+    current = Map.get(state.subscribers, key, MapSet.new())
+
+    if MapSet.size(current) == 0 do
+      data = Protocol.encode_subscribe_perfbuf(handle, map_name)
+      Port.command(state.port, data)
+      {:noreply, %{state | pending: {from, :subscribe_perfbuf, {key, pid}}}}
+    else
+      state = add_subscriber(state, key, pid, :perfbuf)
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:unsubscribe_perfbuf, handle, map_name, pid}, from, %{pending: nil} = state) do
+    key = {handle, map_name}
+    current = Map.get(state.subscribers, key, MapSet.new())
+
+    if not MapSet.member?(current, pid) do
+      {:reply, :ok, state}
+    else
+      state = remove_subscriber(state, key, pid)
+      new_current = Map.get(state.subscribers, key, MapSet.new())
+
+      if MapSet.size(new_current) == 0 do
+        data = Protocol.encode_unsubscribe_perfbuf(handle, map_name)
+        Port.command(state.port, data)
+        {:noreply, %{state | pending: {from, :unsubscribe_perfbuf, nil}}}
+      else
+        {:reply, :ok, state}
+      end
+    end
+  end
+
   def handle_call(msg, from, %{pending: pending} = state) when pending != nil do
     {:noreply, %{state | queue: :queue.in({msg, from}, state.queue)}}
   end
@@ -263,7 +311,33 @@ defmodule VaistoBpf.Loader do
   def handle_info({port, {:data, <<0x10, _::binary>> = data}}, %{port: port} = state) do
     case Protocol.decode_event(data) do
       {:ringbuf_event, handle, map_name, event_data} ->
-        notify_subscribers(state, handle, map_name, event_data)
+        notify_subscribers(state, handle, map_name, {:ringbuf_event, handle, map_name, event_data})
+
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
+  end
+
+  # Perf buffer sample events (0x11) — can arrive ANY time
+  def handle_info({port, {:data, <<0x11, _::binary>> = data}}, %{port: port} = state) do
+    case Protocol.decode_event(data) do
+      {:perfbuf_event, handle, map_name, event_data} ->
+        notify_subscribers(state, handle, map_name, {:perfbuf_event, handle, map_name, event_data})
+
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
+  end
+
+  # Perf buffer lost events (0x12) — can arrive ANY time
+  def handle_info({port, {:data, <<0x12, _::binary>> = data}}, %{port: port} = state) do
+    case Protocol.decode_event(data) do
+      {:perfbuf_lost, handle, map_name, lost_count} ->
+        notify_subscribers(state, handle, map_name, {:perfbuf_lost, handle, map_name, lost_count})
 
       _ ->
         :ok
@@ -300,10 +374,18 @@ defmodule VaistoBpf.Loader do
 
         :ok when cmd == :subscribe_ringbuf ->
           {key, pid} = extra
-          state = add_subscriber(state, key, pid)
+          state = add_subscriber(state, key, pid, :ringbuf)
           {:reply_state, :ok, state}
 
         :ok when cmd == :unsubscribe_ringbuf ->
+          {:reply_state, :ok, state}
+
+        :ok when cmd == :subscribe_perfbuf ->
+          {key, pid} = extra
+          state = add_subscriber(state, key, pid, :perfbuf)
+          {:reply_state, :ok, state}
+
+        :ok when cmd == :unsubscribe_perfbuf ->
           {:reply_state, :ok, state}
 
         {:error, _} = err ->
@@ -340,7 +422,7 @@ defmodule VaistoBpf.Loader do
   # Subscriber process died — clean up
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     case Map.pop(state.monitors, ref) do
-      {{pid, handle, map_name}, monitors} ->
+      {{pid, handle, map_name, buffer_type}, monitors} ->
         key = {handle, map_name}
         current = Map.get(state.subscribers, key, MapSet.new())
         subs = MapSet.delete(current, pid)
@@ -350,14 +432,14 @@ defmodule VaistoBpf.Loader do
           state = %{state | subscribers: subscribers, monitors: monitors}
 
           if state.pending == nil do
-            # Can send unsubscribe now
-            data = Protocol.encode_unsubscribe_ringbuf(handle, map_name)
+            # Can send unsubscribe now — pick the right protocol command
+            {data, cmd} = case buffer_type do
+              :ringbuf -> {Protocol.encode_unsubscribe_ringbuf(handle, map_name), :unsubscribe_ringbuf}
+              :perfbuf -> {Protocol.encode_unsubscribe_perfbuf(handle, map_name), :unsubscribe_perfbuf}
+            end
             Port.command(state.port, data)
-            {:noreply, %{state | pending: {:drain, :unsubscribe_ringbuf, nil}}}
+            {:noreply, %{state | pending: {:drain, cmd, nil}}}
           else
-            # Busy — queue for later. The C subscription stays alive but
-            # events won't be forwarded (no subscribers). It gets cleaned
-            # up when the program is detached or port closes.
             {:noreply, state}
           end
         else
@@ -457,7 +539,7 @@ defmodule VaistoBpf.Loader do
       Port.command(state.port, data)
       %{state | pending: {from, :subscribe_ringbuf, {key, pid}}}
     else
-      state = add_subscriber(state, key, pid)
+      state = add_subscriber(state, key, pid, :ringbuf)
       GenServer.reply(from, :ok)
       dequeue_next(state)
     end
@@ -485,13 +567,50 @@ defmodule VaistoBpf.Loader do
     end
   end
 
+  defp dispatch_queued({:subscribe_perfbuf, handle, map_name, pid}, from, state) do
+    key = {handle, map_name}
+    current = Map.get(state.subscribers, key, MapSet.new())
+
+    if MapSet.size(current) == 0 do
+      data = Protocol.encode_subscribe_perfbuf(handle, map_name)
+      Port.command(state.port, data)
+      %{state | pending: {from, :subscribe_perfbuf, {key, pid}}}
+    else
+      state = add_subscriber(state, key, pid, :perfbuf)
+      GenServer.reply(from, :ok)
+      dequeue_next(state)
+    end
+  end
+
+  defp dispatch_queued({:unsubscribe_perfbuf, handle, map_name, pid}, from, state) do
+    key = {handle, map_name}
+    current = Map.get(state.subscribers, key, MapSet.new())
+
+    if not MapSet.member?(current, pid) do
+      GenServer.reply(from, :ok)
+      dequeue_next(state)
+    else
+      state = remove_subscriber(state, key, pid)
+      new_current = Map.get(state.subscribers, key, MapSet.new())
+
+      if MapSet.size(new_current) == 0 do
+        data = Protocol.encode_unsubscribe_perfbuf(handle, map_name)
+        Port.command(state.port, data)
+        %{state | pending: {from, :unsubscribe_perfbuf, nil}}
+      else
+        GenServer.reply(from, :ok)
+        dequeue_next(state)
+      end
+    end
+  end
+
   # -- Private: subscriber management --
 
-  defp add_subscriber(state, key, pid) do
+  defp add_subscriber(state, key, pid, buffer_type) do
     ref = Process.monitor(pid)
     {handle, map_name} = key
     subs = Map.update(state.subscribers, key, MapSet.new([pid]), &MapSet.put(&1, pid))
-    mons = Map.put(state.monitors, ref, {pid, handle, map_name})
+    mons = Map.put(state.monitors, ref, {pid, handle, map_name, buffer_type})
     %{state | subscribers: subs, monitors: mons}
   end
 
@@ -500,7 +619,7 @@ defmodule VaistoBpf.Loader do
 
     # Find and remove the monitor for this pid + key
     {ref, monitors} =
-      Enum.reduce(state.monitors, {nil, state.monitors}, fn {r, {p, h, m}}, {found, acc} ->
+      Enum.reduce(state.monitors, {nil, state.monitors}, fn {r, {p, h, m, _bt}}, {found, acc} ->
         if p == pid and h == handle and m == map_name do
           {r, Map.delete(acc, r)}
         else
@@ -520,11 +639,11 @@ defmodule VaistoBpf.Loader do
     %{state | subscribers: subscribers, monitors: monitors}
   end
 
-  defp notify_subscribers(state, handle, map_name, data) do
+  defp notify_subscribers(state, handle, map_name, message) do
     key = {handle, map_name}
 
     for pid <- Map.get(state.subscribers, key, MapSet.new()) do
-      send(pid, {:ringbuf_event, handle, map_name, data})
+      send(pid, message)
     end
   end
 

@@ -15,6 +15,8 @@
  *   MAP_GET_NEXT_KEY    (0x08): [0x08][handle:4LE][name_len:1][name:N][key_len:4LE][key:N]
  *                               key_len=0 means "get first key"
  *   LOAD                (0x09): [0x09][elf_size:4LE][elf:N][prog_type:1][target_len:1][target:N]
+ *   SUBSCRIBE_PERFBUF   (0x0A): [0x0A][handle:4LE][name_len:1][name:N]
+ *   UNSUBSCRIBE_PERFBUF (0x0B): [0x0B][handle:4LE][name_len:1][name:N]
  *
  * Responses:
  *   OK (load):              [0x00][handle:4LE][num_maps:1]([name_len:1][name:N])*
@@ -25,6 +27,8 @@
  *
  * Unsolicited events:
  *   RINGBUF_EVENT (0x10): [0x10][handle:4LE][name_len:1][name:N][data_len:4LE][data:N]
+ *   PERFBUF_EVENT (0x11): [0x11][handle:4LE][name_len:1][name:N][data_len:4LE][data:N]
+ *   PERFBUF_LOST  (0x12): [0x12][handle:4LE][name_len:1][name:N][lost_count:8LE]
  */
 
 #define _GNU_SOURCE
@@ -57,16 +61,21 @@
 #define CMD_UNSUBSCRIBE_RINGBUF 0x07
 #define CMD_MAP_GET_NEXT_KEY    0x08
 #define CMD_LOAD              0x09
+#define CMD_SUBSCRIBE_PERFBUF   0x0A
+#define CMD_UNSUBSCRIBE_PERFBUF 0x0B
 
 #define RESP_OK        0x00
 #define RESP_ERROR     0x01
 #define RESP_NOT_FOUND 0x02
 #define RESP_RINGBUF_EVENT 0x10
+#define RESP_PERFBUF_EVENT 0x11
+#define RESP_PERFBUF_LOST  0x12
 
 #define MAX_OBJECTS  16
 #define MAX_RESP     4096
 #define MAX_IFACE    64
 #define MAX_RINGBUFS 8
+#define MAX_PERFBUFS 8
 #define MAX_TARGET   256
 
 /* Program type enum — must match Elixir Protocol.prog_type_byte/1 */
@@ -109,9 +118,18 @@ struct rb_sub {
     int epoll_fd_val;   /* cached fd for epoll removal */
 };
 
+struct pb_sub {
+    struct perf_buffer *pb;
+    uint32_t handle;
+    char map_name[64];
+    int epoll_fd_val;   /* cached fd for epoll removal */
+};
+
 static struct loaded_obj loaded[MAX_OBJECTS];
 static struct rb_sub ringbufs[MAX_RINGBUFS];
 static int num_ringbufs = 0;
+static struct pb_sub perfbufs[MAX_PERFBUFS];
+static int num_perfbufs = 0;
 static int epoll_fd = -1;
 
 /* Sentinel pointer to distinguish stdin from ring buffer in epoll dispatch */
@@ -1202,6 +1220,183 @@ static void handle_unsubscribe_ringbuf(const uint8_t *data, uint16_t len) {
     write_frame(resp, 1);
 }
 
+/* --- Perf buffer event callbacks --- */
+
+static void perfbuf_sample_cb(void *ctx, int cpu, void *data, __u32 data_sz) {
+    struct pb_sub *sub = ctx;
+    uint8_t name_len = (uint8_t)strlen(sub->map_name);
+
+    /* Build: [0x11][handle:4LE][name_len:1][name:N][data_len:4LE][data:N] */
+    size_t base_len = 1 + 4 + 1 + (size_t)name_len + 4;
+    if (data_sz > 65535 - base_len) return;  /* too large for {:packet, 2} framing */
+    uint32_t frame_len = (uint32_t)(base_len + data_sz);
+
+    uint8_t *buf = malloc(frame_len);
+    if (!buf) return;
+
+    uint32_t pos = 0;
+    buf[pos++] = RESP_PERFBUF_EVENT;
+    write_le32(buf + pos, sub->handle);
+    pos += 4;
+    buf[pos++] = name_len;
+    memcpy(buf + pos, sub->map_name, name_len);
+    pos += name_len;
+    write_le32(buf + pos, data_sz);
+    pos += 4;
+    memcpy(buf + pos, data, data_sz);
+    pos += data_sz;
+
+    write_frame(buf, (uint16_t)frame_len);
+    free(buf);
+}
+
+static void perfbuf_lost_cb(void *ctx, int cpu, __u64 lost_cnt) {
+    struct pb_sub *sub = ctx;
+    uint8_t name_len = (uint8_t)strlen(sub->map_name);
+
+    /* Build: [0x12][handle:4LE][name_len:1][name:N][lost_count:8LE] */
+    uint32_t frame_len = 1 + 4 + 1 + (uint32_t)name_len + 8;
+
+    uint8_t *buf = malloc(frame_len);
+    if (!buf) return;
+
+    uint32_t pos = 0;
+    buf[pos++] = RESP_PERFBUF_LOST;
+    write_le32(buf + pos, sub->handle);
+    pos += 4;
+    buf[pos++] = name_len;
+    memcpy(buf + pos, sub->map_name, name_len);
+    pos += name_len;
+    /* Write lost_count as u64 LE */
+    buf[pos++] = (uint8_t)(lost_cnt);
+    buf[pos++] = (uint8_t)(lost_cnt >> 8);
+    buf[pos++] = (uint8_t)(lost_cnt >> 16);
+    buf[pos++] = (uint8_t)(lost_cnt >> 24);
+    buf[pos++] = (uint8_t)(lost_cnt >> 32);
+    buf[pos++] = (uint8_t)(lost_cnt >> 40);
+    buf[pos++] = (uint8_t)(lost_cnt >> 48);
+    buf[pos++] = (uint8_t)(lost_cnt >> 56);
+
+    write_frame(buf, (uint16_t)frame_len);
+    free(buf);
+}
+
+/* --- Perf buffer subscribe/unsubscribe --- */
+
+static void handle_subscribe_perfbuf(const uint8_t *data, uint16_t len) {
+    uint32_t handle;
+    char map_name[256];
+    const uint8_t *rest;
+    uint16_t rest_len;
+
+    if (parse_handle_and_map(data, len, &handle, map_name, &rest, &rest_len) < 0) {
+        send_error("subscribe_perfbuf: parse error");
+        return;
+    }
+
+    if (num_perfbufs >= MAX_PERFBUFS) {
+        send_error("subscribe_perfbuf: too many perf buffer subscriptions");
+        return;
+    }
+
+    struct bpf_map *map = find_map(handle, map_name);
+    if (!map) {
+        send_error("subscribe_perfbuf: map not found");
+        return;
+    }
+
+    int map_fd = bpf_map__fd(map);
+    if (map_fd < 0) {
+        send_error("subscribe_perfbuf: bad map fd");
+        return;
+    }
+
+    if (strlen(map_name) >= sizeof(perfbufs[0].map_name)) {
+        send_error("subscribe_perfbuf: map name too long");
+        return;
+    }
+
+    int idx = num_perfbufs;
+    perfbufs[idx].handle = handle;
+    strncpy(perfbufs[idx].map_name, map_name, sizeof(perfbufs[idx].map_name) - 1);
+    perfbufs[idx].map_name[sizeof(perfbufs[idx].map_name) - 1] = '\0';
+    perfbufs[idx].pb = NULL;
+    perfbufs[idx].epoll_fd_val = -1;
+
+    struct perf_buffer *pb = perf_buffer__new(map_fd, 8,
+        perfbuf_sample_cb, perfbuf_lost_cb, &perfbufs[idx], NULL);
+    if (!pb) {
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "subscribe_perfbuf: perf_buffer__new failed: %s",
+                 strerror(errno));
+        send_error(errbuf);
+        return;
+    }
+
+    int pb_fd = perf_buffer__epoll_fd(pb);
+    if (pb_fd < 0) {
+        perf_buffer__free(pb);
+        send_error("subscribe_perfbuf: perf_buffer__epoll_fd failed");
+        return;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.ptr = &perfbufs[idx];
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, pb_fd, &ev) < 0) {
+        perf_buffer__free(pb);
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "subscribe_perfbuf: epoll_ctl ADD failed: %s",
+                 strerror(errno));
+        send_error(errbuf);
+        return;
+    }
+
+    perfbufs[idx].pb = pb;
+    perfbufs[idx].epoll_fd_val = pb_fd;
+    num_perfbufs++;
+
+    uint8_t resp[1] = { RESP_OK };
+    write_frame(resp, 1);
+}
+
+static void handle_unsubscribe_perfbuf(const uint8_t *data, uint16_t len) {
+    uint32_t handle;
+    char map_name[256];
+    const uint8_t *rest;
+    uint16_t rest_len;
+
+    if (parse_handle_and_map(data, len, &handle, map_name, &rest, &rest_len) < 0) {
+        send_error("unsubscribe_perfbuf: parse error");
+        return;
+    }
+
+    int found = -1;
+    for (int i = 0; i < num_perfbufs; i++) {
+        if (perfbufs[i].handle == handle && strcmp(perfbufs[i].map_name, map_name) == 0) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        send_error("unsubscribe_perfbuf: subscription not found");
+        return;
+    }
+
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, perfbufs[found].epoll_fd_val, NULL);
+    perf_buffer__free(perfbufs[found].pb);
+
+    num_perfbufs--;
+    if (found < num_perfbufs) {
+        perfbufs[found] = perfbufs[num_perfbufs];
+    }
+    memset(&perfbufs[num_perfbufs], 0, sizeof(struct pb_sub));
+
+    uint8_t resp[1] = { RESP_OK };
+    write_frame(resp, 1);
+}
+
 /* --- Cleanup on exit --- */
 
 static void cleanup_all(void) {
@@ -1216,6 +1411,18 @@ static void cleanup_all(void) {
         }
     }
     num_ringbufs = 0;
+
+    /* Free all perf buffer subscriptions */
+    for (int i = 0; i < num_perfbufs; i++) {
+        if (perfbufs[i].pb) {
+            if (epoll_fd >= 0 && perfbufs[i].epoll_fd_val >= 0) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, perfbufs[i].epoll_fd_val, NULL);
+            }
+            perf_buffer__free(perfbufs[i].pb);
+            perfbufs[i].pb = NULL;
+        }
+    }
+    num_perfbufs = 0;
 
     for (int i = 0; i < MAX_OBJECTS; i++) {
         if (loaded[i].obj) {
@@ -1292,6 +1499,12 @@ static void dispatch_command(uint8_t *frame, uint16_t frame_len) {
     case CMD_LOAD:
         handle_load(payload, payload_len);
         break;
+    case CMD_SUBSCRIBE_PERFBUF:
+        handle_subscribe_perfbuf(payload, payload_len);
+        break;
+    case CMD_UNSUBSCRIBE_PERFBUF:
+        handle_unsubscribe_perfbuf(payload, payload_len);
+        break;
     default: {
         char errbuf[64];
         snprintf(errbuf, sizeof(errbuf), "unknown command: 0x%02x", cmd);
@@ -1306,6 +1519,7 @@ static void dispatch_command(uint8_t *frame, uint16_t frame_len) {
 int main(void) {
     memset(loaded, 0, sizeof(loaded));
     memset(ringbufs, 0, sizeof(ringbufs));
+    memset(perfbufs, 0, sizeof(perfbufs));
 
     /* Create epoll instance */
     epoll_fd = epoll_create1(0);
@@ -1323,12 +1537,12 @@ int main(void) {
         return 1;
     }
 
-    /* Event loop: wait on stdin + ring buffer fds */
-    struct epoll_event events[MAX_RINGBUFS + 1];
+    /* Event loop: wait on stdin + ring buffer + perf buffer fds */
+    struct epoll_event events[MAX_RINGBUFS + MAX_PERFBUFS + 1];
     int running = 1;
 
     while (running) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_RINGBUFS + 1, -1);
+        int nfds = epoll_wait(epoll_fd, events, MAX_RINGBUFS + MAX_PERFBUFS + 1, -1);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             break;
@@ -1345,6 +1559,13 @@ int main(void) {
                 }
                 dispatch_command(frame, frame_len);
                 free(frame);
+            } else if (events[i].data.ptr >= (void *)perfbufs &&
+                       events[i].data.ptr < (void *)(perfbufs + MAX_PERFBUFS)) {
+                /* Perf buffer fd ready — consume events (fires sample + lost callbacks) */
+                struct pb_sub *sub = events[i].data.ptr;
+                if (sub && sub->pb) {
+                    perf_buffer__consume(sub->pb);
+                }
             } else {
                 /* Ring buffer fd ready — consume events (fires callback) */
                 struct rb_sub *sub = events[i].data.ptr;

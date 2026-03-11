@@ -15,11 +15,15 @@ defmodule VaistoBpf.Loader.Protocol do
   @cmd_unsubscribe_ringbuf 0x07
   @cmd_map_get_next_key 0x08
   @cmd_load 0x09
+  @cmd_subscribe_perfbuf 0x0A
+  @cmd_unsubscribe_perfbuf 0x0B
 
   @resp_ok 0x00
   @resp_error 0x01
   @resp_not_found 0x02
   @resp_ringbuf_event 0x10
+  @resp_perfbuf_event 0x11
+  @resp_perfbuf_lost 0x12
 
   # Program type byte values (must match C side)
   @prog_type_auto 0
@@ -182,6 +186,22 @@ defmodule VaistoBpf.Loader.Protocol do
     <<@cmd_unsubscribe_ringbuf::8, handle::little-32, name_len::8, map_name::binary>>
   end
 
+  @spec encode_subscribe_perfbuf(non_neg_integer(), String.t()) :: binary()
+  def encode_subscribe_perfbuf(handle, map_name)
+      when is_integer(handle) and handle >= 0 and is_binary(map_name)
+           and byte_size(map_name) <= @max_map_name_len do
+    name_len = byte_size(map_name)
+    <<@cmd_subscribe_perfbuf::8, handle::little-32, name_len::8, map_name::binary>>
+  end
+
+  @spec encode_unsubscribe_perfbuf(non_neg_integer(), String.t()) :: binary()
+  def encode_unsubscribe_perfbuf(handle, map_name)
+      when is_integer(handle) and handle >= 0 and is_binary(map_name)
+           and byte_size(map_name) <= @max_map_name_len do
+    name_len = byte_size(map_name)
+    <<@cmd_unsubscribe_perfbuf::8, handle::little-32, name_len::8, map_name::binary>>
+  end
+
   @spec decode_response(atom(), binary()) ::
           {:ok, map()} | :ok | {:error, String.t()}
   def decode_response(:load, <<@resp_ok, handle::little-32, num_maps::8, rest::binary>>) do
@@ -238,6 +258,14 @@ defmodule VaistoBpf.Loader.Protocol do
     :ok
   end
 
+  def decode_response(:subscribe_perfbuf, <<@resp_ok>>) do
+    :ok
+  end
+
+  def decode_response(:unsubscribe_perfbuf, <<@resp_ok>>) do
+    :ok
+  end
+
   def decode_response(_cmd, <<@resp_error, message::binary>>) do
     {:error, message}
   end
@@ -246,13 +274,31 @@ defmodule VaistoBpf.Loader.Protocol do
     {:error, "unexpected response: #{inspect(data, limit: 50)}"}
   end
 
-  @doc "Decode an unsolicited ring buffer event from the C port."
-  @spec decode_event(binary()) :: {:ringbuf_event, non_neg_integer(), String.t(), binary()} | :unknown
+  @doc "Decode an unsolicited event from the C port (ring buffer or perf buffer)."
+  @spec decode_event(binary()) ::
+          {:ringbuf_event, non_neg_integer(), String.t(), binary()}
+          | {:perfbuf_event, non_neg_integer(), String.t(), binary()}
+          | {:perfbuf_lost, non_neg_integer(), String.t(), non_neg_integer()}
+          | :unknown
   def decode_event(
         <<@resp_ringbuf_event, handle::little-32, name_len::8, name::binary-size(name_len),
           data_len::little-32, data::binary-size(data_len)>>
       ) do
     {:ringbuf_event, handle, name, data}
+  end
+
+  def decode_event(
+        <<@resp_perfbuf_event, handle::little-32, name_len::8, name::binary-size(name_len),
+          data_len::little-32, data::binary-size(data_len)>>
+      ) do
+    {:perfbuf_event, handle, name, data}
+  end
+
+  def decode_event(
+        <<@resp_perfbuf_lost, handle::little-32, name_len::8, name::binary-size(name_len),
+          lost_count::little-64>>
+      ) do
+    {:perfbuf_lost, handle, name, lost_count}
   end
 
   def decode_event(_), do: :unknown

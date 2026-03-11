@@ -1,0 +1,14 @@
+;; XDP program that emits perf events with timestamps.
+;; Demonstrates perf_event_array map type and bpf_perf_event_output helper.
+
+(program :xdp)
+
+(defmap events :perf_event_array 0 0 128)
+
+(extern bpf:perf_event_output [:u64 :u64 :u64 :u64 :u64] :u64)
+(extern bpf:ktime_get_ns [] :u64)
+
+(defn handle [ctx :XdpMd] :u32
+  (let [ts (bpf/ktime_get_ns)]
+    (do (bpf/perf_event_output ctx events 4294967295 ts 8)
+        2)))

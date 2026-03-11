@@ -39,7 +39,7 @@ defmodule VaistoBpf.Helpers do
     trace_printk:           {6,  [:u64, :u64], :u64,                []},
     get_stack:              {67, [:u64, :u64, :u64, :u64], :u64,    []},
     get_stackid:            {27, [:u64, :u64, :u64], :u64,          []},
-    perf_event_output:      {25, [:u64, :u64, :u64, :u64, :u64], :u64, []},
+    perf_event_output:      {25, [:u64, :u64, :u64, :u64, :u64], :u64, [3]},
     get_attach_cookie:      {174, [:u64], :u64,                     []},
 
     # ── System info ─────────────────────────────────────────────────

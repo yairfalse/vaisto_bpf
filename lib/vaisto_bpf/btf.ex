@@ -420,8 +420,6 @@ defmodule VaistoBpf.BTF do
 
     {b, var_type_ids} =
       Enum.reduce(map_defs, {b, []}, fn md, {b, var_ids} ->
-        has_key_value = md.map_type != :ringbuf
-
         # ARRAY for "type" field: element=u32, nelems=map_type_id
         {type_array_id, b} = add_array(b, u32_id, u32_id, MapDef.bpf_map_type_id(md))
         {type_ptr_id, b} = add_ptr(b, type_array_id)
@@ -430,37 +428,51 @@ defmodule VaistoBpf.BTF do
         {max_entries_array_id, b} = add_array(b, u32_id, u32_id, md.max_entries)
         {max_entries_ptr_id, b} = add_ptr(b, max_entries_array_id)
 
-        if has_key_value do
-          # Key and value pointer types
-          {key_type_id, b} = ensure_type_id(b, md.key_type)
-          {value_type_id, b} = ensure_type_id(b, md.value_type)
-          {key_ptr_id, b} = add_ptr(b, key_type_id)
-          {value_ptr_id, b} = add_ptr(b, value_type_id)
+        cond do
+          md.map_type == :perf_event_array ->
+            # Perf event arrays use u32 for both key (CPU index) and value (perf event fd)
+            {perf_u32_id, b} = add_bpf_int(b, :u32)
+            {key_ptr_id, b} = add_ptr(b, perf_u32_id)
+            {value_ptr_id, b} = add_ptr(b, perf_u32_id)
 
-          # STRUCT with 4 members
-          {struct_id, b} = add_struct(b, Atom.to_string(md.name), map_struct_size, [
-            {"type", type_ptr_id, 0},
-            {"key", key_ptr_id, 64},
-            {"value", value_ptr_id, 128},
-            {"max_entries", max_entries_ptr_id, 192}
-          ])
+            {struct_id, b} = add_struct(b, Atom.to_string(md.name), map_struct_size, [
+              {"type", type_ptr_id, 0},
+              {"key", key_ptr_id, 64},
+              {"value", value_ptr_id, 128},
+              {"max_entries", max_entries_ptr_id, 192}
+            ])
 
-          # VAR for this map
-          {var_id, b} = add_var(b, Atom.to_string(md.name), struct_id)
+            {var_id, b} = add_var(b, Atom.to_string(md.name), struct_id)
+            {b, [{md.index, var_id} | var_ids]}
 
-          {b, [{md.index, var_id} | var_ids]}
-        else
-          # Ringbuf: only type + max_entries
-          ringbuf_struct_size = 16
+          md.map_type == :ringbuf ->
+            # Ringbuf: only type + max_entries
+            ringbuf_struct_size = 16
 
-          {struct_id, b} = add_struct(b, Atom.to_string(md.name), ringbuf_struct_size, [
-            {"type", type_ptr_id, 0},
-            {"max_entries", max_entries_ptr_id, 64}
-          ])
+            {struct_id, b} = add_struct(b, Atom.to_string(md.name), ringbuf_struct_size, [
+              {"type", type_ptr_id, 0},
+              {"max_entries", max_entries_ptr_id, 64}
+            ])
 
-          {var_id, b} = add_var(b, Atom.to_string(md.name), struct_id)
+            {var_id, b} = add_var(b, Atom.to_string(md.name), struct_id)
+            {b, [{md.index, var_id} | var_ids]}
 
-          {b, [{md.index, var_id} | var_ids]}
+          true ->
+            # Hash/array: 4 members with actual key/value types
+            {key_type_id, b} = ensure_type_id(b, md.key_type)
+            {value_type_id, b} = ensure_type_id(b, md.value_type)
+            {key_ptr_id, b} = add_ptr(b, key_type_id)
+            {value_ptr_id, b} = add_ptr(b, value_type_id)
+
+            {struct_id, b} = add_struct(b, Atom.to_string(md.name), map_struct_size, [
+              {"type", type_ptr_id, 0},
+              {"key", key_ptr_id, 64},
+              {"value", value_ptr_id, 128},
+              {"max_entries", max_entries_ptr_id, 192}
+            ])
+
+            {var_id, b} = add_var(b, Atom.to_string(md.name), struct_id)
+            {b, [{md.index, var_id} | var_ids]}
         end
       end)
 

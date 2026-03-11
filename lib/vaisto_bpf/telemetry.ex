@@ -34,6 +34,14 @@ defmodule VaistoBpf.Telemetry do
         measurements: %{byte_size: integer}
         metadata: %{map_name: atom}
 
+      [:vaisto_bpf, :perfbuf, :event]
+        measurements: %{byte_size: integer}
+        metadata: %{map_name: atom}
+
+      [:vaisto_bpf, :perfbuf, :lost]
+        measurements: %{lost_count: integer}
+        metadata: %{map_name: atom}
+
       [:vaisto_bpf, :verifier, :reject]
         metadata: %{message: String.t()}
   """
